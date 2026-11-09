@@ -8,6 +8,7 @@ namespace Colours
     const juce::Colour panel      { 0xfff3f1ea };
     const juce::Colour text       { 0xff292929 };
     const juce::Colour accent     { 0xffd52925 };
+    const juce::Colour correlation { 0xffff5f1f };
     const juce::Colour grid       = text.withAlpha (0.12f);
 }
 

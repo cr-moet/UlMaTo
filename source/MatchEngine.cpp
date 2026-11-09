@@ -5,11 +5,16 @@ namespace
     using namespace Spectrum;
 
     constexpr float floorDb        = -60.0f;   // relative level below which a band counts as empty
-    constexpr float maxStaticDb    = 12.0f;    // limits per band
+    constexpr float maxStaticDb    = 12.0f;    // mid/side limits per band
+    constexpr float maxBalanceDb   = 3.0f;     // left/right: only the balance, gently
+    constexpr float maxSideBoostDb = 6.0f;     // side may be raised this much at most (above 400 Hz)
     constexpr float maxDynamicDb   = 9.0f;
-    constexpr float maxPhase       = juce::MathConstants<float>::halfPi;
+    constexpr float maxDynamicSide = 4.0f;     // side: boosts (cuts may go to maxDynamicDb)
+    constexpr float maxPhase       = juce::MathConstants<float>::pi / 4.0f;
     constexpr float boostDbPerSec  = 4.0f;     // dynamic part: gain may rise slowly ...
     constexpr float cutDbPerSec    = 24.0f;    // ... and fall quickly
+    constexpr float sideUpPerSec   = 2.0f;     // side moves slower (the image must not wander)
+    constexpr float sideDownPerSec = 6.0f;
     constexpr float holdDb         = 6.0f;     // current level this far from the average: hold
     constexpr float absentDb       = 10.0f;    // average this far below the long-term level: hold
     constexpr double fastSeconds   = 0.15;     // time constant of the current level
@@ -17,24 +22,39 @@ namespace
 
     float powerGain (float db)   { return std::pow (10.0f, db * 0.1f); }
 
-    // 1/3-octave smoothing (+-2 bands) and limiting, so the EQ has no narrow peaks or notches
-    Curve smooth (const Curve& raw, float limit)
+    // 0 at or below 'from' Hz, 1 at or above 'to' Hz, logarithmic in between
+    float fade (size_t band, float from, float to)
     {
-        Curve out {};
-        for (int b = 0; b < numBands; ++b)
-        {
-            float sum = 0.0f;
-            int count = 0;
-            for (int i = juce::jmax (0, b - 2); i <= juce::jmin (numBands - 1, b + 2); ++i, ++count)
-                sum += raw[(size_t) i];
-            out[(size_t) b] = juce::jlimit (-limit, limit, sum / (float) count);
-        }
-        return out;
+        return juce::jlimit (0.0f, 1.0f, std::log2 (bandFrequency ((float) band) / from) / std::log2 (to / from));
     }
 
-    // Correction (dB) that turns one curve into the reference, both relative to their own
-    // average mid level (only the balance is matched, not the loudness). Empty bands: 0.
-    Curve matchCurve (const Curve& ref, float refLevel, const Curve& in, float inLevel, float limit)
+    // Smoothing twice with a width growing towards the bass (1/3 octave above 800 Hz, one
+    // octave below 200 Hz): broad curves only, so the linear-phase filters ring as little
+    // as possible - narrow bass corrections are what makes linear-phase EQs sound smeared.
+    Curve smooth (const Curve& raw, float limit, int minWidth = 2)
+    {
+        Curve a = raw, b {};
+        for (int pass = 0; pass < 2; ++pass)
+        {
+            for (int k = 0; k < numBands; ++k)
+            {
+                const int w = juce::jmax (minWidth, 2 + juce::roundToInt (4.0f * (1.0f - fade ((size_t) k, 200.0f, 800.0f))));
+                float sum = 0.0f;
+                int count = 0;
+                for (int i = juce::jmax (0, k - w); i <= juce::jmin (numBands - 1, k + w); ++i, ++count)
+                    sum += a[(size_t) i];
+                b[(size_t) k] = sum / (float) count;
+            }
+            a = b;
+        }
+        for (auto& v : a)
+            v = juce::jlimit (-limit, limit, v);
+        return a;
+    }
+
+    // Unsmoothed correction (dB) that turns one curve into the reference, both relative to
+    // their own average mid level (only the balance is matched, not the loudness). Empty bands: 0.
+    Curve rawMatch (const Curve& ref, float refLevel, const Curve& in, float inLevel)
     {
         Curve raw {};
         for (size_t b = 0; b < (size_t) numBands; ++b)
@@ -42,7 +62,20 @@ namespace
             const float r = toDb (ref[b]) - refLevel, l = toDb (in[b]) - inLevel;
             raw[b] = r > floorDb && l > floorDb ? r - l : 0.0f;
         }
-        return smooth (raw, limit);
+        return raw;
+    }
+
+    Curve matchCurve (const Curve& ref, float refLevel, const Curve& in, float inLevel, float limit)
+    {
+        return smooth (rawMatch (ref, refLevel, in, inLevel), limit);
+    }
+
+    // Raising the side signal brings up whatever is decorrelated in it. In the bass that is
+    // what sounds phasy and pulls at the ears, so side boosts fade in between 120 and 400 Hz
+    // and stay moderate everywhere; cuts are always allowed.
+    float limitSide (size_t band, float db)
+    {
+        return juce::jlimit (-maxStaticDb, maxSideBoostDb * fade (band, 120.0f, 400.0f), db);
     }
 
     // Profile as it is after the left/right gains, the phase and the mid/side gains of a correction
@@ -65,26 +98,41 @@ namespace
         return q;
     }
 
-    // Static correction from the learned input to the reference: first left/right and
-    // phase, then mid/side for what is left after that
+    // Static correction from the learned input to the reference:
+    //  - left/right: only the balance between the channels (the tone is done by mid/side),
+    //    broad and within +-3 dB, so the image does not shift from band to band,
+    //  - phase between the channels: only where it is consistent in both signals, not in
+    //    the bass, within +-45 degrees and very broad,
+    //  - mid/side for what is left after that.
     MatchEngine::Correction calculateStatic (const Profile& ref, const Profile& in)
     {
         MatchEngine::Correction c;
         const float refLevel = ref.referenceLevelDb(), inLevel = in.referenceLevelDb();
-        c.left  = matchCurve (ref.left,  refLevel, in.left,  inLevel, maxStaticDb);
-        c.right = matchCurve (ref.right, refLevel, in.right, inLevel, maxStaticDb);
+        const auto dl = rawMatch (ref.left,  refLevel, in.left,  inLevel);
+        const auto dr = rawMatch (ref.right, refLevel, in.right, inLevel);
 
-        // Phase between the channels: only where it is consistent in both signals
-        Curve phase {};
+        Curve balance {}, phase {};
         for (size_t b = 0; b < (size_t) numBands; ++b)
+        {
+            balance[b] = 0.5f * (dl[b] - dr[b]);
             if (ref.coherence (b) > 0.5f && in.coherence (b) > 0.5f)
                 phase[b] = juce::jlimit (-maxPhase, maxPhase, std::remainder (ref.phase (b) - in.phase (b), juce::MathConstants<float>::twoPi));
-        c.phase = smooth (phase, maxPhase);
+        }
+        balance = smooth (balance, maxBalanceDb, 6);
+        phase   = smooth (phase, maxPhase, 6);
+        for (size_t b = 0; b < (size_t) numBands; ++b)
+        {
+            c.left[b]  =  balance[b];
+            c.right[b] = -balance[b];
+            c.phase[b] = phase[b] * fade (b, 150.0f, 400.0f);
+        }
 
         const auto after = applyCorrection (in, c);
         const float afterLevel = after.referenceLevelDb();
         c.mid  = matchCurve (ref.mid,  refLevel, after.mid,  afterLevel, maxStaticDb);
         c.side = matchCurve (ref.side, refLevel, after.side, afterLevel, maxStaticDb);
+        for (size_t b = 0; b < (size_t) numBands; ++b)
+            c.side[b] = limitSide (b, c.side[b]);
         return c;
     }
 
@@ -369,15 +417,17 @@ void MatchEngine::updateFilters (double seconds)
         dynamicMid = dynamicSide = {};
 
     // MATCH scales the static and the dynamic part
+    // (the dynamic curves are smoothed once more: held and moving bands sit side by side)
     const float amount = currentAmount.load (std::memory_order_relaxed);
+    const auto dynMid = smooth (dynamicMid, maxDynamicDb), dynSide = smooth (dynamicSide, maxDynamicDb);
     Correction c;
     for (size_t b = 0; b < (size_t) numBands; ++b)
     {
         c.left[b]  = amount * staticCorrection.left[b];
         c.right[b] = amount * staticCorrection.right[b];
         c.phase[b] = amount * staticCorrection.phase[b];
-        c.mid[b]   = amount * (staticCorrection.mid[b]  + dynamicMid[b]);
-        c.side[b]  = amount * (staticCorrection.side[b] + dynamicSide[b]);
+        c.mid[b]   = amount * (staticCorrection.mid[b] + dynMid[b]);
+        c.side[b]  = amount * limitSide (b, staticCorrection.side[b] + dynSide[b]);
     }
 
     // New filters only when something changed and the audio thread has taken the
@@ -408,12 +458,15 @@ void MatchEngine::updateDynamic (const Spectrum::Profile& ref, const Spectrum::P
     const auto after = applyCorrection (live, staticCorrection);
     const float refLevel = ref.referenceLevelDb(), afterLevel = after.referenceLevelDb();
     const auto targetMid  = matchCurve (ref.mid,  refLevel, after.mid,  afterLevel, maxDynamicDb);
-    const auto targetSide = matchCurve (ref.side, refLevel, after.side, afterLevel, maxDynamicDb);
+    auto targetSide = matchCurve (ref.side, refLevel, after.side, afterLevel, maxDynamicDb);
+    for (auto& v : targetSide)
+        v = juce::jmin (v, maxDynamicSide);
 
     const float up = boostDbPerSec * (float) seconds, down = cutDbPerSec * (float) seconds;
+    const float sideUp = sideUpPerSec * (float) seconds, sideDown = sideDownPerSec * (float) seconds;
     const float longStep = 1.0f - (float) std::exp (-seconds / longSeconds);
 
-    const auto follow = [&] (float& value, float target, float averagePower, float currentPower, float& longDb)
+    const auto follow = [&] (float& value, float target, float averagePower, float currentPower, float& longDb, float rise, float fall)
     {
         const float average = toDb (averagePower);
         if (! longTermValid)
@@ -422,14 +475,14 @@ void MatchEngine::updateDynamic (const Spectrum::Profile& ref, const Spectrum::P
         if (std::abs (toDb (currentPower) - average) > holdDb || average < longDb - absentDb)
             return;   // hold
 
-        value  += juce::jlimit (-down, up, target - value);
+        value  += juce::jlimit (-fall, rise, target - value);
         longDb += longStep * (average - longDb);
     };
 
     for (size_t b = 0; b < (size_t) numBands; ++b)
     {
-        follow (dynamicMid[b],  targetMid[b],  live.mid[b],  fastMid[b],  longMid[b]);
-        follow (dynamicSide[b], targetSide[b], live.side[b], fastSide[b], longSide[b]);
+        follow (dynamicMid[b],  targetMid[b],  live.mid[b],  fastMid[b],  longMid[b],  up, down);
+        follow (dynamicSide[b], targetSide[b], live.side[b], fastSide[b], longSide[b], sideUp, sideDown);
     }
     longTermValid = true;
 }

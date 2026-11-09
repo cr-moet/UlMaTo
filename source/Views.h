@@ -350,12 +350,20 @@ public:
         auto r = getLocalBounds().toFloat();
         g.setColour (Colours::text);
         g.setFont (juce::Font (juce::FontOptions (12.0f, juce::Font::bold)));
-        g.drawText ("OUTPUT SPECTRUM  [dBFS]", r.removeFromTop (18.0f), juce::Justification::centredLeft);
+        g.drawText ("OUTPUT SPECTRUM  [dBFS]  +  PHASE CORRELATION", r.removeFromTop (18.0f), juce::Justification::centredLeft);
 
-        const auto plot = r.withTrimmedLeft (40.0f).withTrimmedBottom (14.0f);
+        const auto plot = r.withTrimmedLeft (40.0f).withTrimmedRight (34.0f).withTrimmedBottom (14.0f);
         constexpr float top = 0.0f, bottom = -96.0f;
         Plot::drawPanel (g, plot);
         Plot::drawGrid (g, plot, top, bottom, 12.0f, true);
+
+        // Phase correlation on its own scale (right): +1 at the top, -1 at the bottom
+        g.setFont (juce::Font (juce::FontOptions (10.0f)));
+        g.setColour (Colours::correlation);
+        for (float v : { 1.0f, 0.5f, 0.0f, -0.5f, -1.0f })
+            g.drawText ((v > 0.0f ? "+" : "") + juce::String (v, 1),
+                        juce::Rectangle<float> (plot.getRight() + 4.0f, Plot::yOf (v, 1.0f, -1.0f, plot) - 6.0f, 30.0f, 12.0f),
+                        juce::Justification::centredLeft);
 
         if (reference.valid)
         {
@@ -363,6 +371,8 @@ public:
                              [&] (int b) { return Spectrum::toDb (reference.side[(size_t) b]); });
             Plot::drawCurve (g, plot, top, bottom, Colours::accent.withAlpha (0.6f), 1.2f, true,
                              [&] (int b) { return Spectrum::toDb (reference.mid[(size_t) b]); });
+            Plot::drawCurve (g, plot, 1.0f, -1.0f, Colours::correlation.withAlpha (0.55f), 1.2f, true,
+                             [&] (int b) { return reference.correlation ((size_t) b); });
         }
         if (live.valid)
         {
@@ -370,8 +380,10 @@ public:
                              [&] (int b) { return Spectrum::toDb (live.side[(size_t) b]); });
             Plot::drawCurve (g, plot, top, bottom, Colours::accent, 1.6f, false,
                              [&] (int b) { return Spectrum::toDb (live.mid[(size_t) b]); });
+            Plot::drawCurve (g, plot, 1.0f, -1.0f, Colours::correlation, 1.6f, false,
+                             [&] (int b) { return live.correlation ((size_t) b); });
         }
-        Plot::drawLegend (g, plot, { { "MID", Colours::accent }, { "SIDE", Colours::text },
+        Plot::drawLegend (g, plot, { { "MID", Colours::accent }, { "SIDE", Colours::text }, { "CORRELATION", Colours::correlation },
                                      { "   - - REFERENCE", Colours::text.withAlpha (0.6f) } });
 
         if (! live.valid || ! reference.valid)
