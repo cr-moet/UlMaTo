@@ -15,10 +15,11 @@
 //                Bands that drop out or return are held until the analysis has caught
 //                up, boosts change slowly and cuts quickly, so returning bass does not
 //                pump or overshoot.
-// Both are combined into one 2x2 filter matrix (one convolution stage). Before it sits
-// the multiband dynamics stage (Dynamics::Matcher), which maps the dynamic range of the
-// input (learned or live) per band to the one of the reference. The audio runs 10 ms
-// behind the analysis and the level detectors (lookahead).
+// Both are combined into one 2x2 filter matrix (one convolution stage). Before or after
+// it (setDynamicsFirst) sits the multiband dynamics stage (Dynamics::Matcher), which
+// maps the dynamic range of its input (learned or live) per band to the one of the
+// reference. The 10 ms lookahead delay always sits in front of the dynamics stage, so
+// both orders have the same latency. The audio runs 10 ms behind the analysis.
 //
 // Audio thread  - process(): hands input/output to the engine thread, applies the filters.
 // Engine thread - analysis, learning, correction and filter design (about every 40 ms);
@@ -52,6 +53,9 @@ public:
     Spectrum::Profile getLearned() const;
     Spectrum::Profile getOutputProfile() const;   // processed signal, for the display
 
+    // Order of the stages; a change mutes the output for about 0.1 s (the paths differ)
+    void setDynamicsFirst (bool first) noexcept      { dynamicsFirstRequest = first; }
+
     // Dynamics (any thread except audio)
     void setReferenceDynamics (const Dynamics::Profile& reference);
     void setLearnedDynamics (const Dynamics::Profile& learned);
@@ -59,7 +63,7 @@ public:
 
     struct DynamicsState
     {
-        Dynamics::Profile input, output;   // live input (last ~15 s), processed signal
+        Dynamics::Profile input, output;   // live input of the dynamics stage (last ~15 s), output
         Dynamics::Values slope {};         // applied slope per band (output range / input range)
         bool fromLearned = false;          // input range taken from the learned input
     };
@@ -88,7 +92,8 @@ private:
         juce::AudioBuffer<float> frame { 2, Spectrum::Analyser::size };
         int newSamples = 0;
         Spectrum::Analyser analyser;
-        Dynamics::Analyser dynamics;
+        Dynamics::Analyser dynamics;   // only used with withDynamics
+        bool withDynamics = false;
 
         void reset();
         void push (const float* l, const float* r, int numSamples) noexcept;   // audio thread
@@ -136,6 +141,13 @@ private:
     // Audio thread: lookahead delay, block buffering, convolution
     MatrixConvolver convolver;
     Dynamics::Matcher dynamics;
+    Dynamics::Analyser stageDynamics;   // engine thread: readings of the dynamics stage
+
+    // Order of the stages and the mute while it changes
+    std::atomic<bool> dynamicsFirstRequest { false };
+    bool dynamicsFirst = false;
+    float switchGain = 1.0f, switchStep = 0.0f;
+    int switchMute = 0;
     juce::AudioBuffer<float> delayLine;
     int delayPosition = 0;
     std::vector<float> blockL, blockR, outL, outR;

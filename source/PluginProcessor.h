@@ -20,7 +20,8 @@ namespace ParamIDs
 // way (LEARN); MATCH then moves the signal towards the reference with a static
 // correction (learned input -> reference) followed by a dynamic one that follows
 // the music. The dynamics of the reference in five bands are matched by a multiband
-// compressor / expander with its own amount (DYNAMICS). See MatchEngine and Dynamics.
+// compressor / expander with its own amount (DYNAMICS); EQ and dynamics can run in
+// either order. See MatchEngine and Dynamics.
 // Bypass: cross-fade to the input, delayed by the latency.
 //==============================================================================
 class UlMaToProcessor final : public juce::AudioProcessor
@@ -84,6 +85,10 @@ public:
 
     // Spectrum of the processed signal (for the display)
     Spectrum::Profile getOutputProfile() const             { return engine.getOutputProfile(); }
+
+    // Order of the stages (message thread; stored with the project)
+    void setDynamicsFirst (bool first);
+    bool isDynamicsFirst() const;
 
     // Dynamics: live input / output distributions, slopes and current gain per band
     MatchEngine::DynamicsState getDynamicsState() const    { return engine.getDynamicsState(); }

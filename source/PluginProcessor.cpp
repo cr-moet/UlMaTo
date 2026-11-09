@@ -6,7 +6,7 @@ namespace
     const juce::Identifier fileProperty ("referenceFile"), startProperty ("rangeStart"),
                            endProperty ("rangeEnd"), profileProperty ("referenceProfile"),
                            learnedProperty ("learnedProfile"), referenceDynamicsProperty ("referenceDynamics"),
-                           learnedDynamicsProperty ("learnedDynamics");
+                           learnedDynamicsProperty ("learnedDynamics"), dynamicsFirstProperty ("dynamicsFirst");
 
     constexpr int dryBlockSize = 1024;   // bypass is handled in chunks of this size
 
@@ -193,6 +193,17 @@ juce::Range<double> UlMaToProcessor::getReferenceRange() const
              (double) apvts.state.getProperty (endProperty, 0.0) };
 }
 
+void UlMaToProcessor::setDynamicsFirst (bool first)
+{
+    apvts.state.setProperty (dynamicsFirstProperty, first, nullptr);
+    engine.setDynamicsFirst (first);
+}
+
+bool UlMaToProcessor::isDynamicsFirst() const
+{
+    return (bool) apvts.state.getProperty (dynamicsFirstProperty, false);
+}
+
 Spectrum::Profile UlMaToProcessor::getReferenceProfile() const
 {
     const juce::ScopedLock lock (referenceLock);
@@ -302,6 +313,7 @@ void UlMaToProcessor::setStateInformation (const void* data, int sizeInBytes)
             for (const auto& id : { profileProperty, learnedProperty, referenceDynamicsProperty, learnedDynamicsProperty })
                 state.removeProperty (id, nullptr);
             apvts.replaceState (state);
+            engine.setDynamicsFirst (isDynamicsFirst());
 
             if (profile.valid)
                 setReferenceProfile (profile, dynamics);   // saved by an older version: no dynamics until analysed again

@@ -198,7 +198,8 @@ void MatchEngine::Tap::read (double decay, double fastDecay, Spectrum::Analyser*
         // Dynamics: every sample; the live distribution covers about the last 15 s
         const float* newL = frame.getReadPointer (0, size - hop + newSamples);
         const float* newR = frame.getReadPointer (1, size - hop + newSamples);
-        dynamics.process (newL, newR, count, dynamicsDecay);
+        if (withDynamics)
+            dynamics.process (newL, newR, count, dynamicsDecay);
         if (alsoToDynamics != nullptr)
             alsoToDynamics->process (newL, newR, count);
 
@@ -248,9 +249,14 @@ void MatchEngine::prepare (double newSampleRate, int)
 
     convolver.prepare (blockSize, firLength);
     dynamics.prepare (sampleRate);
-    input.dynamics.prepare (sampleRate);
+    stageDynamics.prepare (sampleRate);
     output.dynamics.prepare (sampleRate);
+    output.withDynamics = true;
     learnDynamics.prepare (sampleRate);
+    dynamicsFirst = dynamicsFirstRequest.load();
+    switchGain = 1.0f;
+    switchStep = 1.0f / (float) (sampleRate * 0.01);
+    switchMute = 0;
 
     // Both slots start neutral (pure delay)
     applied = {};
@@ -363,19 +369,56 @@ void MatchEngine::process (juce::AudioBuffer<float>& buffer, float amount, float
 
     for (int i = 0; i < numSamples; ++i)
     {
-        // Dynamics: detector on the input now, gain on the delayed signal
+        // Dynamics first: lookahead delay + dynamics -> filters -> output
+        // Filters first:  filters -> lookahead delay + dynamics -> output
+        // (the detector always gets the signal 10 ms before the gain is applied)
         const auto d = (size_t) delayPosition, b = (size_t) blockPosition;
+        const float inL = left[i], inR = right[i];
         float l = delayL[d], r = delayR[d];
-        dynamics.process (left[i], right[i], l, r);
-        blockL[b] = l;
-        blockR[b] = r;
-        delayL[d] = left[i];
-        delayR[d] = right[i];
+        if (dynamicsFirst)
+        {
+            dynamics.process (inL, inR, l, r);
+            blockL[b] = l;
+            blockR[b] = r;
+            delayL[d] = inL;
+            delayR[d] = inR;
+            l = outL[b];
+            r = outR[b];
+        }
+        else
+        {
+            blockL[b] = inL;
+            blockR[b] = inR;
+            dynamics.process (outL[b], outR[b], l, r);
+            delayL[d] = outL[b];
+            delayR[d] = outR[b];
+        }
         delayPosition = (delayPosition + 1) % lookahead;
 
-        left[i] = outL[b];   // processed block, one block behind
+        // Changing the order: fade out, switch, stay silent until the old signal has
+        // left the delay and the filters, fade in
+        if (switchMute > 0 || dynamicsFirstRequest.load (std::memory_order_relaxed) != dynamicsFirst || switchGain < 1.0f)
+        {
+            if (switchMute > 0)
+                --switchMute;
+            else if (dynamicsFirstRequest.load (std::memory_order_relaxed) != dynamicsFirst)
+            {
+                if ((switchGain -= switchStep) <= 0.0f)
+                {
+                    switchGain = 0.0f;
+                    dynamicsFirst = ! dynamicsFirst;
+                    switchMute = lookahead + blockSize + firLength;
+                }
+            }
+            else
+                switchGain = juce::jmin (1.0f, switchGain + switchStep);
+            l *= switchGain;
+            r *= switchGain;
+        }
+
+        left[i] = l;
         if (right != left)
-            right[i] = outR[b];
+            right[i] = r;
 
         if (++blockPosition < blockSize)
             continue;
@@ -567,9 +610,9 @@ void MatchEngine::updateDynamic (const Spectrum::Profile& ref, const Spectrum::P
     longTermValid = true;
 }
 
-// Dynamics: slope per band = reference range / input range (from the learned input if
-// there is one, otherwise from the live input), scaled by the dynamics amount; the pivot
-// is always the live median, so a changed input level does not matter.
+// Dynamics: slope per band from the reference range and the input range (of the learned
+// input if there is one, otherwise of the live input), scaled by the dynamics amount; the
+// pivot is always the live median, so a changed input level does not matter.
 void MatchEngine::updateDynamicsMatch()
 {
     DynamicsState state;
@@ -580,8 +623,9 @@ void MatchEngine::updateDynamicsMatch()
         learnedInput = learnedDynamics;
     }
 
-    if (input.dynamics.hasData (2.0))
-        state.input = input.dynamics.getProfile();
+    dynamics.readLevels ([this] (const Dynamics::Values& levels) { stageDynamics.addLevels (levels, dynamicsDecay); });
+    if (stageDynamics.hasData (2.0))
+        state.input = stageDynamics.getProfile();
     if (output.dynamics.hasData (2.0))
         state.output = output.dynamics.getProfile();
 
@@ -594,9 +638,16 @@ void MatchEngine::updateDynamicsMatch()
     {
         state.slope[b] = 1.0f;
         pivot[b] = state.input.median[b];
-        if (ref.valid && state.input.valid && ref.active[b] && in.active[b] && state.input.active[b]
-             && ref.range[b] > 0.3f && in.range[b] > 0.3f)
-            state.slope[b] = std::pow (juce::jlimit (minSlope, maxSlope, ref.range[b] / in.range[b]), amount);
+        if (! (ref.valid && state.input.valid && ref.active[b] && in.active[b] && state.input.active[b]
+                && ref.range[b] > 0.3f && in.upper[b] > 0.3f && in.lower[b] > 0.3f))
+            continue;
+
+        // The stage only changes one side of the median: compression scales the part above
+        // it, expansion the part below it, so that the whole range becomes the reference range
+        const float target = ref.range[b];
+        const float slope = target < in.range[b] ? (target - in.lower[b]) / in.upper[b]
+                                                 : (target - in.upper[b]) / in.lower[b];
+        state.slope[b] = std::pow (juce::jlimit (minSlope, maxSlope, slope), amount);
     }
     dynamics.setTargets (state.slope, pivot);
 

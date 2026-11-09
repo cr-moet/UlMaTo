@@ -4,7 +4,7 @@
 
 //==============================================================================
 // Layout from top to bottom: header with BYPASS, reference song (waveform + ANALYZE,
-// LEARN), tabs, then one of two pages:
+// LEARN), tabs (in processing order, can be dragged), then one of two pages:
 //  EQ MATCH       - the three analysis displays, the output spectrum, MATCH / RESPONSE
 //  DYNAMICS MATCH - level distributions per band, DYNAMICS knob
 //==============================================================================
@@ -28,7 +28,7 @@ private:
     juce::TextButton bypassButton { "BYPASS" };
     juce::AudioProcessorValueTreeState::ButtonAttachment bypassAttachment { processor.apvts, ParamIDs::bypass, bypassButton };
 
-    juce::TextButton eqTab { "EQ MATCH" }, dynamicsTab { "DYNAMICS MATCH" };
+    StageTabs tabs;   // page selection and order of the stages
 
     WaveformView waveform { processor };
     juce::TextButton analyseButton { "ANALYZE" };
@@ -57,6 +57,7 @@ private:
     juce::AudioProcessorValueTreeState::SliderAttachment dynamicsAttachment { processor.apvts, ParamIDs::dynamics, dynamicsKnob };
 
     juce::Rectangle<int> tabLine;
+    int currentPage = 0;
     int shownReferenceVersion = -1, shownLearnedVersion = -1;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (UlMaToEditor)

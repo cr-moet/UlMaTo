@@ -7,12 +7,14 @@
 //
 // The level of each band is followed by a detector (attack 5 ms, release by band).
 // Its readings (100 per second) form a histogram per band, from which follow the
-// median level and the dynamic range (95th minus 10th percentile, quiet passages
-// more than 30 dB below the average are ignored).
+// median level and the dynamic range (95th minus 10th percentile). Readings more than
+// 20 dB below the average of the band are ignored: a band that is missing for a while
+// (bass pause, break) does not pull the median down.
 //
-// Matching: the level of each band is mapped around its median so that its range
-// becomes the range of the reference - compression where the input is more dynamic,
-// expansion where it is flatter. Both channels get the same gain (no image shift).
+// Matching: like a compressor with its threshold at the median - the part above it is
+// compressed where the input is more dynamic than the reference, the part below it is
+// expanded (pushed down) where the input is flatter. Gain is only ever reduced, so
+// nothing is raised after a pause. Both channels get the same gain (no image shift).
 //==============================================================================
 namespace Dynamics
 {
@@ -38,6 +40,7 @@ namespace Dynamics
     {
         std::array<Histogram, numBands> histogram {};   // weights (any scale)
         Values median {}, range {};                     // dB
+        Values upper {}, lower {};                      // dB: 95th - median, median - 10th percentile
         std::array<bool, numBands> active {};           // band has enough signal
         bool valid = false;
 
@@ -56,12 +59,12 @@ namespace Dynamics
                 }
 
                 active[b] = false;
-                median[b] = range[b] = 0.0f;
+                median[b] = range[b] = upper[b] = lower[b] = 0.0f;
                 if (total <= 0.0)
                     continue;
 
-                // Gate: 30 dB below the energy average (and above -80 dBFS)
-                const float gate = juce::jmax (-80.0f, (float) (10.0 * std::log10 (energy / total)) - 30.0f);
+                // Gate: 20 dB below the energy average (and above -80 dBFS)
+                const float gate = juce::jmax (-80.0f, (float) (10.0 * std::log10 (energy / total)) - 20.0f);
                 const int first = juce::jlimit (0, histogramSize - 1, (int) ((gate - histogramMin) / histogramStep));
 
                 double gated = 0.0;
@@ -86,7 +89,9 @@ namespace Dynamics
                 };
 
                 median[b] = percentile (0.5);
-                range[b]  = percentile (0.95) - percentile (0.10);
+                upper[b]  = percentile (0.95) - median[b];
+                lower[b]  = median[b] - percentile (0.10);
+                range[b]  = upper[b] + lower[b];
                 active[b] = true;
                 valid = true;
             }
@@ -225,7 +230,10 @@ namespace Dynamics
                 if (++counter >= interval)
                 {
                     counter = 0;
-                    addReading (decay);
+                    Values levels;
+                    for (size_t b = 0; b < (size_t) numBands; ++b)
+                        levels[b] = detector.levelDb (b);
+                    addLevels (levels, decay);
                 }
             }
         }
@@ -243,13 +251,12 @@ namespace Dynamics
             return p;
         }
 
-    private:
-        void addReading (double decay) noexcept
+        // One reading (dB per band), e.g. from the detector of a Matcher
+        void addLevels (const Values& levels, double decay = 1.0) noexcept
         {
-            Values levels;
             float loudest = -200.0f;
-            for (size_t b = 0; b < (size_t) numBands; ++b)
-                loudest = juce::jmax (loudest, levels[b] = detector.levelDb (b));
+            for (auto v : levels)
+                loudest = juce::jmax (loudest, v);
 
             if (loudest < -90.0f)   // silence (pause, stopped transport) is not counted
                 return;
@@ -268,6 +275,7 @@ namespace Dynamics
             weight = weight * decay + 1.0;
         }
 
+    private:
         Splitter splitter;
         Detector detector;
         std::array<std::array<double, histogramSize>, numBands> histogram {};
@@ -280,9 +288,13 @@ namespace Dynamics
     // before the lookahead delay, the bands are taken from the delayed signal, so
     // the gain is in place when a transient arrives.
     //
-    // Gain per band (dB) = (slope - 1) * (level - pivot), slope = target range / input
-    // range: < 1 compresses, > 1 expands. Limited to +-12 dB; more than 24 dB below the
-    // pivot it fades out (quiet passages and noise are neither raised nor pushed down).
+    // Gain per band (dB), never above 0 and at most -12 dB:
+    //  - slope < 1 (compression): (slope - 1) * (level - pivot) above the pivot, 0 below,
+    //  - slope > 1 (expansion):   (slope - 1) * (level - pivot) below the pivot (fading out
+    //    from 24 to 36 dB below it), 0 above.
+    // A band that is missing or far down is therefore never raised.
+    // The detector readings (100 per second) are passed on to the engine thread, which
+    // builds the live level distribution of the signal at this point from them.
     class Matcher
     {
     public:
@@ -293,6 +305,7 @@ namespace Dynamics
             detector.prepare (sampleRate);
             smoothing = 1.0f - std::exp (-1.0f / (float) (sampleRate * 0.05));   // targets glide over 50 ms
             fadeStep  = 1.0f / (float) (sampleRate * 0.02);                     // in / out of the path: 20 ms
+            readingInterval = juce::jmax (1, juce::roundToInt (sampleRate / readingsPerSecond));
             reset();
         }
 
@@ -306,7 +319,8 @@ namespace Dynamics
             gain.fill (1.0f);
             gainStep.fill (0.0f);
             fade = 0.0f;
-            counter = 0;
+            counter = readingCounter = 0;
+            readings.reset();
             for (size_t b = 0; b < (size_t) numBands; ++b)
             {
                 targetSlope[b].store (1.0f, std::memory_order_relaxed);
@@ -335,6 +349,15 @@ namespace Dynamics
             if (--counter <= 0)
                 updateGains();
 
+            if (--readingCounter <= 0)
+            {
+                readingCounter = readingInterval;
+                const auto scope = readings.write (1);   // engine thread too slow: reading dropped
+                if (scope.blockSize1 > 0)
+                    for (size_t b = 0; b < (size_t) numBands; ++b)
+                        levelBuffer[(size_t) scope.startIndex1][b] = detector.levelDb (b);
+            }
+
             splitter.process (l, r, bl, br);
             float wetL = 0.0f, wetR = 0.0f;
             for (size_t b = 0; b < (size_t) numBands; ++b)
@@ -352,8 +375,19 @@ namespace Dynamics
 
         float getGainDb (size_t band) const noexcept   { return gainsDb[band].load (std::memory_order_relaxed); }
 
+        // Engine thread: hands over the detector readings since the last call
+        template <typename Fn>
+        void readLevels (Fn&& use)
+        {
+            const auto scope = readings.read (readings.getNumReady());
+            for (int i = 0; i < scope.blockSize1; ++i) use (levelBuffer[(size_t) (scope.startIndex1 + i)]);
+            for (int i = 0; i < scope.blockSize2; ++i) use (levelBuffer[(size_t) (scope.startIndex2 + i)]);
+        }
+
     private:
         static constexpr int gainInterval = 8;   // gains are calculated every 8 samples and ramped
+        static constexpr float maxCutDb = 12.0f;
+        static constexpr int numReadings = 1024;
 
         void updateGains() noexcept
         {
@@ -367,12 +401,13 @@ namespace Dynamics
                 pivot[b] += glide * (targetPivot[b].load (std::memory_order_relaxed) - pivot[b]);
                 needed = needed || std::abs (targetS - 1.0f) > 1.0e-3f || std::abs (slope[b] - 1.0f) > 1.0e-3f;
 
-                const float d = detector.levelDb (b) - pivot[b];
-                const float weight = juce::jlimit (0.0f, 1.0f, (d + 36.0f) / 12.0f);   // fade out below -24 dB
-                const float db = juce::jlimit (-12.0f, 12.0f, (slope[b] - 1.0f) * juce::jlimit (-24.0f, 24.0f, d) * weight);
+                const float d = juce::jlimit (-36.0f, 24.0f, detector.levelDb (b) - pivot[b]);
+                const float db = slope[b] < 1.0f ? (slope[b] - 1.0f) * juce::jmax (0.0f, d)
+                                                 : (slope[b] - 1.0f) * juce::jmin (0.0f, d) * juce::jlimit (0.0f, 1.0f, (d + 36.0f) / 12.0f);
+                const float gainDb = juce::jmax (-maxCutDb, db);
 
-                gainStep[b] = (juce::Decibels::decibelsToGain (db) - gain[b]) / (float) gainInterval;
-                gainsDb[b].store (db, std::memory_order_relaxed);
+                gainStep[b] = (juce::Decibels::decibelsToGain (gainDb) - gain[b]) / (float) gainInterval;
+                gainsDb[b].store (gainDb, std::memory_order_relaxed);
             }
         }
 
@@ -382,6 +417,8 @@ namespace Dynamics
         std::array<std::atomic<float>, numBands> targetSlope, targetPivot, gainsDb;
         float smoothing = 0.0f, fade = 0.0f, fadeStep = 0.0f;
         bool needed = false;
-        int counter = 0;
+        int counter = 0, readingCounter = 0, readingInterval = 480;
+        juce::AbstractFifo readings { numReadings };
+        std::array<Values, numReadings> levelBuffer {};
     };
 }

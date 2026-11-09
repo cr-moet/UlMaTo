@@ -16,17 +16,14 @@ UlMaToEditor::UlMaToEditor (UlMaToProcessor& p)
     bypassButton.setColour (juce::TextButton::textColourOnId, Colours::background);
     addAndMakeVisible (bypassButton);
 
-    // Tabs: the selected one is dark
-    for (auto* tab : { &eqTab, &dynamicsTab })
+    // Tabs: click = page, drag = order of the stages
+    tabs.onSelect = [this] (int page) { showPage (page); };
+    tabs.onOrderChange = [this] (bool dynamicsFirst)
     {
-        tab->setClickingTogglesState (true);
-        tab->setRadioGroupId (1);
-        tab->setColour (juce::TextButton::buttonOnColourId, Colours::text);
-        tab->setColour (juce::TextButton::textColourOnId, Colours::background);
-        addAndMakeVisible (tab);
-    }
-    eqTab.onClick       = [this] { if (eqTab.getToggleState())       showPage (0); };
-    dynamicsTab.onClick = [this] { if (dynamicsTab.getToggleState()) showPage (1); };
+        processor.setDynamicsFirst (dynamicsFirst);
+        tabs.setState (currentPage, dynamicsFirst);
+    };
+    addAndMakeVisible (tabs);
 
     addAndMakeVisible (waveform);
     waveform.onFileChanged = [this] { statusLabel.setText ("Select a range and press ANALYZE", juce::dontSendNotification); };
@@ -97,7 +94,8 @@ UlMaToEditor::~UlMaToEditor()
 void UlMaToEditor::showPage (int page)
 {
     const bool dynamics = page == 1;
-    (dynamics ? dynamicsTab : eqTab).setToggleState (true, juce::dontSendNotification);
+    currentPage = page;
+    tabs.setState (page, processor.isDynamicsFirst());
     processor.apvts.state.setProperty (pageProperty, page, nullptr);
 
     for (auto* c : std::initializer_list<juce::Component*> { &stereoView, &midSideView, &phaseView, &liveView,
@@ -116,6 +114,8 @@ void UlMaToEditor::timerCallback()
     if (busy)
         statusLabel.setText ("Analysing ... " + juce::String (juce::roundToInt (processor.getAnalysisProgress() * 100.0f)) + " %",
                              juce::dontSendNotification);
+
+    tabs.setState (currentPage, processor.isDynamicsFirst());   // the order may come from a loaded project
 
     // LEARN: button text and LED
     const bool learning = learnButton.getToggleState();
@@ -196,10 +196,7 @@ void UlMaToEditor::resized()
     area.removeFromTop (12);
 
     // Tabs
-    auto tabs = area.removeFromTop (28);
-    eqTab.setBounds (tabs.removeFromLeft (160));
-    tabs.removeFromLeft (4);
-    dynamicsTab.setBounds (tabs.removeFromLeft (180));
+    tabs.setBounds (area.removeFromTop (28));
     tabLine = area.removeFromTop (2);
     area.removeFromTop (12);
 
