@@ -250,6 +250,8 @@ void MatchEngine::prepare (double newSampleRate, int)
     convolver.prepare (blockSize, firLength);
     dynamics.prepare (sampleRate);
     stageDynamics.prepare (sampleRate);
+    pivot = {};
+    pivotValid = {};
     output.dynamics.prepare (sampleRate);
     output.withDynamics = true;
     learnDynamics.prepare (sampleRate);
@@ -612,7 +614,7 @@ void MatchEngine::updateDynamic (const Spectrum::Profile& ref, const Spectrum::P
 
 // Dynamics: slope per band from the reference range and the input range (of the learned
 // input if there is one, otherwise of the live input), scaled by the dynamics amount; the
-// pivot is always the live median, so a changed input level does not matter.
+// pivot is always the live centre, so a changed input level does not matter.
 void MatchEngine::updateDynamicsMatch()
 {
     DynamicsState state;
@@ -623,7 +625,16 @@ void MatchEngine::updateDynamicsMatch()
         learnedInput = learnedDynamics;
     }
 
-    dynamics.readLevels ([this] (const Dynamics::Values& levels) { stageDynamics.addLevels (levels, dynamicsDecay); });
+    // Readings of the stage; their average per band tells whether a band is there right now
+    Dynamics::Values current {};
+    int numReadings = 0;
+    dynamics.readLevels ([&] (const Dynamics::Values& levels)
+    {
+        stageDynamics.addLevels (levels, dynamicsDecay);
+        for (size_t b = 0; b < (size_t) Dynamics::numBands; ++b)
+            current[b] += levels[b];
+        ++numReadings;
+    });
     if (stageDynamics.hasData (2.0))
         state.input = stageDynamics.getProfile();
     if (output.dynamics.hasData (2.0))
@@ -633,19 +644,27 @@ void MatchEngine::updateDynamicsMatch()
     const auto& in = learnedInput.valid ? learnedInput : state.input;
     const float amount = currentDynamicsAmount.load (std::memory_order_relaxed);
 
-    Dynamics::Values pivot {};
+    // Pivot: the live centre, gliding (3 s) so that it never jumps; held while a band is
+    // missing right now (more than 15 dB below it), so it is in place when the band returns
+    const auto now = juce::Time::getMillisecondCounterHiRes();
+    const float glide = 1.0f - std::exp (-(float) juce::jlimit (0.0, 1.0, (now - lastPivotUpdate) * 0.001) / 3.0f);
+    lastPivotUpdate = now;
+
     for (size_t b = 0; b < (size_t) Dynamics::numBands; ++b)
     {
         state.slope[b] = 1.0f;
-        pivot[b] = state.input.median[b];
+        const bool missing = pivotValid[b] && (numReadings == 0 || current[b] / (float) numReadings < pivot[b] - 15.0f);
+        if (state.input.valid && state.input.active[b] && ! missing)
+            pivot[b] = pivotValid[b] ? pivot[b] + glide * (state.input.centre[b] - pivot[b]) : state.input.centre[b];
+        pivotValid[b] = pivotValid[b] || (state.input.valid && state.input.active[b]);
         if (! (ref.valid && state.input.valid && ref.active[b] && in.active[b] && state.input.active[b]
                 && ref.range[b] > 0.3f && in.upper[b] > 0.3f && in.lower[b] > 0.3f))
             continue;
 
-        // The stage only changes one side of the median: compression scales the part above
-        // it, expansion the part below it, so that the whole range becomes the reference range
+        // Compression works on both sides of the centre (down above, up below), expansion
+        // only below it: the whole range becomes the reference range
         const float target = ref.range[b];
-        const float slope = target < in.range[b] ? (target - in.lower[b]) / in.upper[b]
+        const float slope = target < in.range[b] ? target / in.range[b]
                                                  : (target - in.upper[b]) / in.lower[b];
         state.slope[b] = std::pow (juce::jlimit (minSlope, maxSlope, slope), amount);
     }

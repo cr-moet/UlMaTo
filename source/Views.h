@@ -412,7 +412,7 @@ private:
 
 //==============================================================================
 // Dynamics page: one column per band with the level distributions (relative to their
-// own median, so only the shape - the dynamics - is compared), the dynamic ranges,
+// own centre, so only the shape - the dynamics - is compared), the dynamic ranges,
 // the ratio and the current gain of the multiband stage
 //==============================================================================
 class DynamicsView final : public juce::Component,
@@ -429,7 +429,7 @@ public:
         auto legend = area.removeFromTop (18.0f);
         g.setFont (juce::Font (juce::FontOptions (12.0f, juce::Font::bold)));
         g.setColour (Colours::text);
-        g.drawText ("DYNAMICS PER BAND  (level distribution around the median)", legend, juce::Justification::centredLeft);
+        g.drawText ("DYNAMICS PER BAND  (level distribution around the centre)", legend, juce::Justification::centredLeft);
         Plot::drawLegend (g, legend.translated (0.0f, -3.0f), { { "OUTPUT", Colours::accent }, { "   INPUT", Colours::text.withAlpha (0.45f) },
                                                                 { "   - - REFERENCE", Colours::text } });
         area.removeFromTop (6.0f);
@@ -453,7 +453,7 @@ public:
     void setReference (const Dynamics::Profile& p)   { reference = p; repaint(); }
 
 private:
-    static constexpr float lowest = -30.0f, highest = 18.0f;   // dB around the median
+    static constexpr float lowest = -30.0f, highest = 18.0f;   // dB around the centre
 
     void paintBand (juce::Graphics& g, size_t b, juce::Rectangle<float> r)
     {
@@ -510,8 +510,8 @@ private:
                       : slope < 1.0f ? juce::String (1.0f / slope, 2) + " : 1"
                                      : "1 : " + juce::String (slope, 2) + "  EXP", Colours::text);
 
-        // Gain meter: 0 dB at the right end of the bar, -12 dB at the left; the value in
-        // a fixed box at the right edge
+        // Gain meter: -12 dB at the left, +4 dB at the right, a fixed 0 dB mark in between;
+        // the value in a fixed box at the right edge
         info.removeFromTop (6.0f);
         auto meter = info.removeFromTop (16.0f);
         auto valueBox = meter.removeFromRight (62.0f);
@@ -520,9 +520,13 @@ private:
         g.fillRect (meter);
         g.setColour (Colours::text.withAlpha (0.5f));
         g.drawRect (meter, 1.0f);
-        const float x = meter.getRight() - meter.getWidth() * juce::jlimit (0.0f, 1.0f, -gains[b] / 12.0f);
+        const auto xOf = [&meter] (float db) { return meter.getX() + meter.getWidth() * (juce::jlimit (-12.0f, 4.0f, db) + 12.0f) / 16.0f; };
+        const float zero = xOf (0.0f), x = xOf (gains[b]);
         g.setColour (Colours::accent);
-        g.fillRect (juce::Rectangle<float>::leftTopRightBottom (x, meter.getY() + 2.0f, meter.getRight() - 1.0f, meter.getBottom() - 2.0f));
+        g.fillRect (juce::Rectangle<float>::leftTopRightBottom (juce::jmin (zero, x), meter.getY() + 2.0f,
+                                                                juce::jmax (zero, x), meter.getBottom() - 2.0f));
+        g.setColour (Colours::text);
+        g.fillRect (zero - 0.5f, meter.getY(), 1.0f, meter.getHeight());
 
         g.setColour (Colours::text);
         g.fillRect (valueBox);
@@ -533,7 +537,7 @@ private:
                     valueBox.reduced (4.0f, 0.0f), juce::Justification::centredRight);
     }
 
-    // Histogram of one band, shifted by its median, slightly smoothed, scaled to its maximum
+    // Histogram of one band, shifted by its centre, slightly smoothed, scaled to its maximum
     static void drawDistribution (juce::Graphics& g, juce::Rectangle<float> plot, const Dynamics::Profile& p, size_t b,
                                   juce::Colour colour, bool filled, bool dashed)
     {
@@ -557,7 +561,7 @@ private:
         bool started = false;
         for (int i = 0; i < Dynamics::histogramSize; ++i)
         {
-            const float db = Dynamics::binLevel ((float) i) - p.median[b];
+            const float db = Dynamics::binLevel ((float) i) - p.centre[b];
             if (db < lowest || db > highest)
                 continue;
             const juce::Point<float> pt { plot.getX() + plot.getWidth() * (db - lowest) / (highest - lowest),

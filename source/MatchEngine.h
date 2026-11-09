@@ -142,6 +142,9 @@ private:
     MatrixConvolver convolver;
     Dynamics::Matcher dynamics;
     Dynamics::Analyser stageDynamics;   // engine thread: readings of the dynamics stage
+    Dynamics::Values pivot {};          // engine thread: gliding centre per band
+    std::array<bool, Dynamics::numBands> pivotValid {};
+    double lastPivotUpdate = 0.0;
 
     // Order of the stages and the mute while it changes
     std::atomic<bool> dynamicsFirstRequest { false };

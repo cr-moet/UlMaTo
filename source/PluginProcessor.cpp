@@ -39,7 +39,7 @@ namespace
         return p;
     }
 
-    // Dynamics profile <-> text: the histograms (median and range follow from them)
+    // Dynamics profile <-> text: the histograms (centre and range follow from them)
     juce::String dynamicsToString (const Dynamics::Profile& p)
     {
         return p.valid ? juce::MemoryBlock (p.histogram.data(), sizeof (p.histogram)).toBase64Encoding() : juce::String();
