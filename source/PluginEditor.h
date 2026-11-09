@@ -27,15 +27,15 @@ private:
     void showPage (int page);
     StageTabs::Bypassed bypassedStages() const;
 
-    UlMaToProcessor& processor;
+    UlMaToProcessor& processorRef;
     UlMaToLookAndFeel lookAndFeel;
 
     juce::TextButton bypassButton { "BYPASS" };
-    juce::AudioProcessorValueTreeState::ButtonAttachment bypassAttachment { processor.apvts, ParamIDs::bypass, bypassButton };
+    juce::AudioProcessorValueTreeState::ButtonAttachment bypassAttachment { processorRef.apvts, ParamIDs::bypass, bypassButton };
 
     StageTabs tabs;   // page selection and order of the stages
 
-    WaveformView waveform { processor };
+    WaveformView waveform { processorRef };
     juce::TextButton analyseButton { "ANALYZE" };
     juce::Label statusLabel;
 
@@ -47,19 +47,19 @@ private:
     ProfileView stereoView  { ProfileView::Kind::stereo,  "STEREO  (L / R)  [dBFS]" },
                 midSideView { ProfileView::Kind::midSide, "MID / SIDE  [dBFS]" },
                 phaseView   { ProfileView::Kind::phase,   "PHASE CORRELATION" };
-    LiveView liveView { processor };
+    LiveView liveView { processorRef };
 
     juce::Slider matchKnob    { juce::Slider::RotaryHorizontalVerticalDrag, juce::Slider::TextBoxBelow },
                  responseKnob { juce::Slider::RotaryHorizontalVerticalDrag, juce::Slider::TextBoxBelow };
     juce::Label matchLabel, responseLabel;
-    juce::AudioProcessorValueTreeState::SliderAttachment matchAttachment    { processor.apvts, ParamIDs::amount,   matchKnob },
-                                                         responseAttachment { processor.apvts, ParamIDs::response, responseKnob };
+    juce::AudioProcessorValueTreeState::SliderAttachment matchAttachment    { processorRef.apvts, ParamIDs::amount,   matchKnob },
+                                                         responseAttachment { processorRef.apvts, ParamIDs::response, responseKnob };
 
     // Dynamics page
-    DynamicsView dynamicsView { processor };
+    DynamicsView dynamicsView { processorRef };
     juce::Slider dynamicsKnob { juce::Slider::RotaryHorizontalVerticalDrag, juce::Slider::TextBoxBelow };
     juce::Label dynamicsLabel, dynamicsInfo;
-    juce::AudioProcessorValueTreeState::SliderAttachment dynamicsAttachment { processor.apvts, ParamIDs::dynamics, dynamicsKnob };
+    juce::AudioProcessorValueTreeState::SliderAttachment dynamicsAttachment { processorRef.apvts, ParamIDs::dynamics, dynamicsKnob };
 
     // Analog heat page: a knob with its name above it
     struct LabelledKnob
@@ -73,19 +73,19 @@ private:
     juce::Rectangle<int> tapePanel, transportPanel, outputPanel;
 
     // PhaseQ, graphic EQ, limiter pages
-    PhaseQView phaseQView { processor };
+    PhaseQView phaseQView { processorRef };
     LabelledKnob rotationKnob;
     juce::ComboBox phaseModeBox;
     juce::Label phaseModeLabel;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> phaseModeAttachment;
 
-    GraphicEqView graphicEqView { processor };
+    GraphicEqView graphicEqView { processorRef };
 
-    LimiterView limiterView { processor };
+    LimiterView limiterView { processorRef };
     std::array<LabelledKnob, 4> limiterKnobs;   // input, ceiling, release, link
     juce::TextButton limiterOnButton { "LIMITER ON" }, truePeakButton { "TRUE PEAK" };
-    juce::AudioProcessorValueTreeState::ButtonAttachment limiterOnAttachment { processor.apvts, ParamIDs::limiterOn, limiterOnButton },
-                                                         truePeakAttachment  { processor.apvts, ParamIDs::limiterTruePeak, truePeakButton };
+    juce::AudioProcessorValueTreeState::ButtonAttachment limiterOnAttachment { processorRef.apvts, ParamIDs::limiterOn, limiterOnButton },
+                                                         truePeakAttachment  { processorRef.apvts, ParamIDs::limiterTruePeak, truePeakButton };
 
     std::array<std::vector<juce::Component*>, MatchEngine::numStages> pages;
     juce::Rectangle<int> tabLine;

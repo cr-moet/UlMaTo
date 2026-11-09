@@ -242,17 +242,17 @@ public:
     class ValueBox final : public juce::Label
     {
     public:
-        void editorShown (juce::TextEditor* editor) override
+        void editorShown (juce::TextEditor* textEditor) override
         {
-            juce::Label::editorShown (editor);
-            editor->setText ({}, juce::dontSendNotification);
+            juce::Label::editorShown (textEditor);
+            textEditor->setText ({}, juce::dontSendNotification);
         }
 
-        void editorAboutToBeHidden (juce::TextEditor* editor) override
+        void editorAboutToBeHidden (juce::TextEditor* textEditor) override
         {
-            if (editor->getText().trim().isEmpty())
-                editor->setText (getText(), juce::dontSendNotification);
-            juce::Label::editorAboutToBeHidden (editor);
+            if (textEditor->getText().trim().isEmpty())
+                textEditor->setText (getText(), juce::dontSendNotification);
+            juce::Label::editorAboutToBeHidden (textEditor);
         }
     };
 

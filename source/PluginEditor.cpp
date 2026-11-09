@@ -7,7 +7,7 @@ namespace
 }
 
 UlMaToEditor::UlMaToEditor (UlMaToProcessor& p)
-    : AudioProcessorEditor (p), processor (p)
+    : AudioProcessorEditor (p), processorRef (p)
 {
     setLookAndFeel (&lookAndFeel);
 
@@ -20,16 +20,16 @@ UlMaToEditor::UlMaToEditor (UlMaToProcessor& p)
     tabs.onSelect = [this] (int page) { showPage (page); };
     tabs.onOrderChange = [this] (const MatchEngine::Order& order)
     {
-        processor.setStageOrder (order);
+        processorRef.setStageOrder (order);
         tabs.setState (currentPage, order, bypassedStages());
     };
     tabs.onBypassToggle = [this] (int stage)
     {
-        auto* p = processor.apvts.getParameter (ParamIDs::stageBypass[stage]);
-        p->beginChangeGesture();
-        p->setValueNotifyingHost (p->getValue() > 0.5f ? 0.0f : 1.0f);
-        p->endChangeGesture();
-        tabs.setState (currentPage, processor.getStageOrder(), bypassedStages());
+        auto* parameter = processorRef.apvts.getParameter (ParamIDs::stageBypass[stage]);
+        parameter->beginChangeGesture();
+        parameter->setValueNotifyingHost (parameter->getValue() > 0.5f ? 0.0f : 1.0f);
+        parameter->endChangeGesture();
+        tabs.setState (currentPage, processorRef.getStageOrder(), bypassedStages());
     };
     addAndMakeVisible (tabs);
 
@@ -37,7 +37,7 @@ UlMaToEditor::UlMaToEditor (UlMaToProcessor& p)
     waveform.onFileChanged = [this] { statusLabel.setText ("Select a range and press ANALYZE", juce::dontSendNotification); };
 
     analyseButton.setColour (juce::TextButton::textColourOffId, Colours::accent);
-    analyseButton.onClick = [this] { processor.analyseReference(); };
+    analyseButton.onClick = [this] { processorRef.analyseReference(); };
     addAndMakeVisible (analyseButton);
 
     statusLabel.setFont (juce::Font (juce::FontOptions (12.0f)));
@@ -45,8 +45,8 @@ UlMaToEditor::UlMaToEditor (UlMaToProcessor& p)
 
     learnButton.setClickingTogglesState (true);
     learnButton.getProperties().set ("led", true);
-    learnButton.setToggleState (processor.isLearning(), juce::dontSendNotification);
-    learnButton.onClick = [this] { processor.setLearning (learnButton.getToggleState()); };
+    learnButton.setToggleState (processorRef.isLearning(), juce::dontSendNotification);
+    learnButton.onClick = [this] { processorRef.setLearning (learnButton.getToggleState()); };
     addAndMakeVisible (learnButton);
     addAndMakeVisible (learnLed);
     learnLabel.setFont (juce::Font (juce::FontOptions (12.0f, juce::Font::bold)));
@@ -91,7 +91,7 @@ UlMaToEditor::UlMaToEditor (UlMaToProcessor& p)
         k.knob.setTextBoxStyle (juce::Slider::TextBoxBelow, false, 96, 20);
         k.knob.setColour (juce::Slider::textBoxBackgroundColourId, Colours::text);
         k.knob.setColour (juce::Slider::textBoxTextColourId, Colours::accent);
-        k.attachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (processor.apvts, id, k.knob);
+        k.attachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (processorRef.apvts, id, k.knob);
         k.label.setText (text, juce::dontSendNotification);
         k.label.setFont (juce::Font (juce::FontOptions (12.0f, juce::Font::bold)));
         k.label.setJustificationType (juce::Justification::centred);
@@ -114,7 +114,7 @@ UlMaToEditor::UlMaToEditor (UlMaToProcessor& p)
     addChildComponent (phaseQView);
     setUpKnobOn (MatchEngine::phaseStage, rotationKnob, ParamIDs::phaseRotation, "ROTATION");
     phaseModeBox.addItemList (Tone::phaseModeNames, 1);
-    phaseModeAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (processor.apvts, ParamIDs::phaseMode, phaseModeBox);
+    phaseModeAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (processorRef.apvts, ParamIDs::phaseMode, phaseModeBox);
     addChildComponent (phaseModeBox);
     phaseModeLabel.setText ("APPLY TO", juce::dontSendNotification);
     phaseModeLabel.setFont (juce::Font (juce::FontOptions (12.0f, juce::Font::bold)));
@@ -146,7 +146,7 @@ UlMaToEditor::UlMaToEditor (UlMaToProcessor& p)
     setResizable (true, true);
     setResizeLimits (900, 700, 2400, 1600);
     setSize (1100, 840);
-    showPage ((int) processor.apvts.state.getProperty (pageProperty, 0));
+    showPage ((int) processorRef.apvts.state.getProperty (pageProperty, 0));
     sendLookAndFeelChange();   // the value boxes of the knobs were created before the look was set
 
     timerCallback();
@@ -161,8 +161,8 @@ UlMaToEditor::~UlMaToEditor()
 void UlMaToEditor::showPage (int page)
 {
     currentPage = juce::jlimit (0, (int) pages.size() - 1, page);
-    tabs.setState (currentPage, processor.getStageOrder(), bypassedStages());
-    processor.apvts.state.setProperty (pageProperty, currentPage, nullptr);
+    tabs.setState (currentPage, processorRef.getStageOrder(), bypassedStages());
+    processorRef.apvts.state.setProperty (pageProperty, currentPage, nullptr);
 
     for (size_t p = 0; p < pages.size(); ++p)
         for (auto* c : pages[p])
@@ -174,42 +174,42 @@ StageTabs::Bypassed UlMaToEditor::bypassedStages() const
 {
     StageTabs::Bypassed b {};
     for (size_t stage = 0; stage < b.size(); ++stage)
-        b[stage] = processor.apvts.getRawParameterValue (ParamIDs::stageBypass[stage])->load() > 0.5f;
+        b[stage] = processorRef.apvts.getRawParameterValue (ParamIDs::stageBypass[stage])->load() > 0.5f;
     return b;
 }
 
 // Analysis state and new results
 void UlMaToEditor::timerCallback()
 {
-    const bool busy = processor.isAnalysing();
-    analyseButton.setEnabled (! busy && processor.getReferenceFile().existsAsFile());
+    const bool busy = processorRef.isAnalysing();
+    analyseButton.setEnabled (! busy && processorRef.getReferenceFile().existsAsFile());
 
     if (busy)
-        statusLabel.setText ("Analysing ... " + juce::String (juce::roundToInt (processor.getAnalysisProgress() * 100.0f)) + " %",
+        statusLabel.setText ("Analysing ... " + juce::String (juce::roundToInt (processorRef.getAnalysisProgress() * 100.0f)) + " %",
                              juce::dontSendNotification);
 
-    tabs.setState (currentPage, processor.getStageOrder(), bypassedStages());   // order / bypass may come from the host or a project
+    tabs.setState (currentPage, processorRef.getStageOrder(), bypassedStages());   // order / bypass may come from the host or a project
 
     // LEARN: button text and LED
     const bool learning = learnButton.getToggleState();
-    const auto learned  = processor.getLearnedProfile();
+    const auto learned  = processorRef.getLearnedProfile();
     learnButton.setButtonText (learning ? "STOP LEARNING" : "LEARN INPUT");
     learnLed.setState (learning ? Led::State::blinking : learned.valid ? Led::State::on : Led::State::off);
     learnLabel.setText (learning ? "LEARNING INPUT ..." : learned.valid ? "INPUT ANALYSED" : "INPUT NOT ANALYSED",
                         juce::dontSendNotification);
 
-    const int refVersion = processor.getReferenceVersion(), learnedVersion = processor.getLearnedVersion();
+    const int refVersion = processorRef.getReferenceVersion(), learnedVersion = processorRef.getLearnedVersion();
     if (refVersion != shownReferenceVersion || learnedVersion != shownLearnedVersion)
     {
-        const auto profile = processor.getReferenceProfile();
+        const auto profile = processorRef.getReferenceProfile();
         for (auto* view : { &stereoView, &midSideView, &phaseView })
             view->setProfiles (profile, learned);
         liveView.setReference (profile);
-        dynamicsView.setReference (processor.getReferenceDynamics());
+        dynamicsView.setReference (processorRef.getReferenceDynamics());
 
-        dynamicsInfo.setText (! processor.getReferenceDynamics().valid
+        dynamicsInfo.setText (! processorRef.getReferenceDynamics().valid
                                   ? "No dynamics of the reference yet:\npress ANALYZE"
-                                  : processor.getLearnedDynamics().valid
+                                  : processorRef.getLearnedDynamics().valid
                                         ? "Input dynamics: learned (LEARN)"
                                         : "Input dynamics: live\n(last 15 s) - use LEARN for\na fixed ratio per band",
                               juce::dontSendNotification);
