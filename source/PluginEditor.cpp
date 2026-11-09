@@ -21,7 +21,15 @@ UlMaToEditor::UlMaToEditor (UlMaToProcessor& p)
     tabs.onOrderChange = [this] (const MatchEngine::Order& order)
     {
         processor.setStageOrder (order);
-        tabs.setState (currentPage, order);
+        tabs.setState (currentPage, order, bypassedStages());
+    };
+    tabs.onBypassToggle = [this] (int stage)
+    {
+        auto* p = processor.apvts.getParameter (ParamIDs::stageBypass[stage]);
+        p->beginChangeGesture();
+        p->setValueNotifyingHost (p->getValue() > 0.5f ? 0.0f : 1.0f);
+        p->endChangeGesture();
+        tabs.setState (currentPage, processor.getStageOrder(), bypassedStages());
     };
     addAndMakeVisible (tabs);
 
@@ -78,7 +86,7 @@ UlMaToEditor::UlMaToEditor (UlMaToProcessor& p)
     addChildComponent (dynamicsInfo);
 
     // Analog heat page
-    const auto setUpKnob = [this] (LabelledKnob& k, const char* id, const juce::String& text)
+    const auto setUpKnobOn = [this] (int page, LabelledKnob& k, const char* id, const juce::String& text)
     {
         k.knob.setTextBoxStyle (juce::Slider::TextBoxBelow, false, 70, 20);
         k.knob.setColour (juce::Slider::textBoxBackgroundColourId, Colours::text);
@@ -89,8 +97,9 @@ UlMaToEditor::UlMaToEditor (UlMaToProcessor& p)
         k.label.setJustificationType (juce::Justification::centred);
         addChildComponent (k.knob);
         addChildComponent (k.label);
-        pages[MatchEngine::analogStage].insert (pages[MatchEngine::analogStage].end(), { &k.knob, &k.label });
+        pages[(size_t) page].insert (pages[(size_t) page].end(), { &k.knob, &k.label });
     };
+    const auto setUpKnob = [&] (LabelledKnob& k, const char* id, const juce::String& text) { setUpKnobOn (MatchEngine::analogStage, k, id, text); };
     for (size_t b = 0; b < tapeKnobs.size(); ++b)
         setUpKnob (tapeKnobs[b], ParamIDs::tape[b], juce::String (Dynamics::bandNames[b]) + "\n" + Dynamics::bandRanges[b]);
     setUpKnob (heatKnobs[0], ParamIDs::wow,         "WOW");
@@ -100,6 +109,37 @@ UlMaToEditor::UlMaToEditor (UlMaToProcessor& p)
     setUpKnob (heatKnobs[4], ParamIDs::transformer, "TRANSFORMER");
     for (auto& k : tapeKnobs)
         k.label.setFont (juce::Font (juce::FontOptions (12.0f, juce::Font::bold)));
+
+    // PhaseQ: nodes, rotation, mode
+    addChildComponent (phaseQView);
+    setUpKnobOn (MatchEngine::phaseStage, rotationKnob, ParamIDs::phaseRotation, "ROTATION");
+    phaseModeBox.addItemList (Tone::phaseModeNames, 1);
+    phaseModeAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (processor.apvts, ParamIDs::phaseMode, phaseModeBox);
+    addChildComponent (phaseModeBox);
+    phaseModeLabel.setText ("APPLY TO", juce::dontSendNotification);
+    phaseModeLabel.setFont (juce::Font (juce::FontOptions (12.0f, juce::Font::bold)));
+    phaseModeLabel.setJustificationType (juce::Justification::centred);
+    addChildComponent (phaseModeLabel);
+    pages[MatchEngine::phaseStage].insert (pages[MatchEngine::phaseStage].end(), { &phaseQView, &phaseModeBox, &phaseModeLabel });
+
+    // Graphic EQ
+    addChildComponent (graphicEqView);
+    pages[MatchEngine::graphicEqStage] = { &graphicEqView };
+
+    // Limiter
+    addChildComponent (limiterView);
+    setUpKnobOn (MatchEngine::limiterStage, limiterKnobs[0], ParamIDs::limiterInput,   "INPUT GAIN");
+    setUpKnobOn (MatchEngine::limiterStage, limiterKnobs[1], ParamIDs::limiterCeiling, "CEILING");
+    setUpKnobOn (MatchEngine::limiterStage, limiterKnobs[2], ParamIDs::limiterRelease, "RELEASE");
+    setUpKnobOn (MatchEngine::limiterStage, limiterKnobs[3], ParamIDs::limiterLink,    "STEREO LINK");
+    for (auto* b : { &limiterOnButton, &truePeakButton })
+    {
+        b->setClickingTogglesState (true);
+        b->setColour (juce::TextButton::buttonOnColourId, Colours::accent);
+        b->setColour (juce::TextButton::textColourOnId, Colours::background);
+        addChildComponent (b);
+    }
+    pages[MatchEngine::limiterStage].insert (pages[MatchEngine::limiterStage].end(), { &limiterView, &limiterOnButton, &truePeakButton });
 
     pages[MatchEngine::eqStage] = { &stereoView, &midSideView, &phaseView, &liveView, &matchKnob, &responseKnob, &matchLabel, &responseLabel };
     pages[MatchEngine::dynamicsStage] = { &dynamicsView, &dynamicsKnob, &dynamicsLabel, &dynamicsInfo };
@@ -121,13 +161,21 @@ UlMaToEditor::~UlMaToEditor()
 void UlMaToEditor::showPage (int page)
 {
     currentPage = juce::jlimit (0, (int) pages.size() - 1, page);
-    tabs.setState (currentPage, processor.getStageOrder());
+    tabs.setState (currentPage, processor.getStageOrder(), bypassedStages());
     processor.apvts.state.setProperty (pageProperty, currentPage, nullptr);
 
     for (size_t p = 0; p < pages.size(); ++p)
         for (auto* c : pages[p])
             c->setVisible ((int) p == currentPage);
     repaint();
+}
+
+StageTabs::Bypassed UlMaToEditor::bypassedStages() const
+{
+    StageTabs::Bypassed b {};
+    for (size_t stage = 0; stage < b.size(); ++stage)
+        b[stage] = processor.apvts.getRawParameterValue (ParamIDs::stageBypass[stage])->load() > 0.5f;
+    return b;
 }
 
 // Analysis state and new results
@@ -140,7 +188,7 @@ void UlMaToEditor::timerCallback()
         statusLabel.setText ("Analysing ... " + juce::String (juce::roundToInt (processor.getAnalysisProgress() * 100.0f)) + " %",
                              juce::dontSendNotification);
 
-    tabs.setState (currentPage, processor.getStageOrder());   // the order may come from a loaded project
+    tabs.setState (currentPage, processor.getStageOrder(), bypassedStages());   // order / bypass may come from the host or a project
 
     // LEARN: button text and LED
     const bool learning = learnButton.getToggleState();
@@ -260,6 +308,44 @@ void UlMaToEditor::resized()
         placeRow (tapePanel, tapeKnobs, 0, tapeKnobs.size());
         placeRow (transportPanel, heatKnobs, 0, 3);
         placeRow (outputPanel, heatKnobs, 3, 2);
+    }
+
+    // PhaseQ page: the nodes, rotation and mode on the right
+    {
+        auto page = area;
+        auto side = page.removeFromRight (200);
+        page.removeFromRight (16);
+        phaseQView.setBounds (page);
+        side.removeFromTop (24);
+        rotationKnob.label.setBounds (side.removeFromTop (20));
+        rotationKnob.knob.setBounds (side.removeFromTop (juce::jmin (180, side.getHeight() / 2)));
+        side.removeFromTop (20);
+        phaseModeLabel.setBounds (side.removeFromTop (20));
+        phaseModeBox.setBounds (side.removeFromTop (28).reduced (20, 0));
+    }
+
+    // Graphic EQ page
+    graphicEqView.setBounds (area);
+
+    // Limiter page: history above, controls below
+    {
+        auto page = area;
+        auto knobRow = page.removeFromBottom (juce::jmin (210, page.getHeight() / 2));
+        page.removeFromBottom (12);
+        limiterView.setBounds (page);
+
+        auto buttons = knobRow.removeFromRight (180).withSizeKeepingCentre (160, 80);
+        limiterOnButton.setBounds (buttons.removeFromTop (34));
+        buttons.removeFromTop (12);
+        truePeakButton.setBounds (buttons.removeFromTop (34));
+
+        const int w = knobRow.getWidth() / (int) limiterKnobs.size();
+        for (auto& k : limiterKnobs)
+        {
+            auto cell = knobRow.removeFromLeft (w);
+            k.label.setBounds (cell.removeFromTop (22));
+            k.knob.setBounds (cell.withSizeKeepingCentre (juce::jmin (cell.getWidth(), 160), juce::jmin (cell.getHeight(), 170)));
+        }
     }
 
     // Dynamics page: the bands, the DYNAMICS knob on the right

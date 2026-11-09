@@ -119,6 +119,63 @@ juce::AudioProcessorValueTreeState::ParameterLayout UlMaToProcessor::createParam
     addPercent (ParamIDs::crackle,     "Vinyl Crackle", 0.0f);
     addPercent (ParamIDs::tube,        "Tube",        0.0f);
     addPercent (ParamIDs::transformer, "Transformer", 0.0f);
+
+    // Graphic EQ
+    const auto hz = juce::AudioParameterFloatAttributes().withLabel ("Hz")
+                        .withStringFromValueFunction ([] (float v, int) { return v < 1000.0f ? juce::String (v, 0) + " Hz" : juce::String (v / 1000.0f, 2) + " kHz"; });
+    const auto db = juce::AudioParameterFloatAttributes().withLabel ("dB")
+                        .withStringFromValueFunction ([] (float v, int) { return (v > 0.0f ? "+" : "") + juce::String (v, 1) + " dB"; });
+    juce::NormalisableRange<float> freqRange (20.0f, 20000.0f, 0.1f);
+    freqRange.setSkewForCentre (632.0f);   // log-like: the centre of the knob range is the geometric middle
+    juce::NormalisableRange<float> qRange (0.2f, 8.0f, 0.01f);
+    qRange.setSkewForCentre (1.0f);
+    for (int b = 0; b < Tone::numBands; ++b)
+    {
+        const auto n = juce::String (b + 1);
+        layout.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { ParamIDs::eqFreq[b], 1 }, "EQ " + n + " Freq", freqRange, Tone::eqDefaultFreq[b], hz));
+        layout.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { ParamIDs::eqGain[b], 1 }, "EQ " + n + " Gain",
+                                                                 juce::NormalisableRange<float> (-18.0f, 18.0f, 0.01f), 0.0f, db));
+        layout.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { ParamIDs::eqQ[b], 1 }, "EQ " + n + " Q", qRange,
+                                                                 Tone::eqTypes[b] == Tone::EqType::bell ? 1.0f : 0.71f));
+    }
+
+    // PhaseQ
+    const auto degrees = juce::AudioParameterFloatAttributes().withLabel ("deg")
+                             .withStringFromValueFunction ([] (float v, int) { return (v > 0.0f ? "+" : "") + juce::String (v, 0) + juce::String (juce::CharPointer_UTF8 ("\xc2\xb0")); });
+    for (int n = 0; n < Tone::numBands; ++n)
+    {
+        const auto i = juce::String (n + 1);
+        layout.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { ParamIDs::phaseFreq[n], 1 }, "Phase " + i + " Freq", freqRange, Tone::phaseDefaultFreq[n], hz));
+        layout.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { ParamIDs::phaseAmount[n], 1 }, "Phase " + i + " Amount",
+                                                                 juce::NormalisableRange<float> (-180.0f, 180.0f, 0.1f), 0.0f, degrees));
+        layout.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { ParamIDs::phaseWidth[n], 1 }, "Phase " + i + " Width",
+                                                                 juce::NormalisableRange<float> (0.2f, 4.0f, 0.01f), 1.0f,
+                                                                 juce::AudioParameterFloatAttributes().withLabel ("oct")));
+    }
+    layout.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { ParamIDs::phaseRotation, 1 }, "Phase Rotation",
+                                                             juce::NormalisableRange<float> (-180.0f, 180.0f, 0.1f), 0.0f, degrees));
+    layout.add (std::make_unique<juce::AudioParameterChoice> (juce::ParameterID { ParamIDs::phaseMode, 1 }, "Phase Mode", Tone::phaseModeNames, 0));
+
+    // Limiter
+    juce::NormalisableRange<float> releaseRange (1.0f, 1000.0f, 0.1f);
+    releaseRange.setSkewForCentre (100.0f);
+    layout.add (std::make_unique<juce::AudioParameterBool> (juce::ParameterID { ParamIDs::limiterOn, 1 }, "Limiter On", true));
+    layout.add (std::make_unique<juce::AudioParameterBool> (juce::ParameterID { ParamIDs::limiterTruePeak, 1 }, "Limiter True Peak", true));
+    layout.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { ParamIDs::limiterInput, 1 }, "Limiter Input",
+                                                             juce::NormalisableRange<float> (0.0f, 24.0f, 0.01f), 0.0f, db));
+    layout.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { ParamIDs::limiterCeiling, 1 }, "Limiter Ceiling",
+                                                             juce::NormalisableRange<float> (-6.0f, 0.0f, 0.01f), -0.3f,
+                                                             juce::AudioParameterFloatAttributes().withLabel ("dBFS")
+                                                                 .withStringFromValueFunction ([] (float v, int) { return juce::String (v, 2) + " dBFS"; })));
+    layout.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { ParamIDs::limiterRelease, 1 }, "Limiter Release", releaseRange, 100.0f,
+                                                             juce::AudioParameterFloatAttributes().withLabel ("ms")
+                                                                 .withStringFromValueFunction ([] (float v, int) { return juce::String (v, v < 10.0f ? 1 : 0) + " ms"; })));
+    addPercent (ParamIDs::limiterLink, "Limiter Link", 100.0f);
+
+    static constexpr const char* stageNames[] { "EQ Match", "Dynamics", "Analog Heat", "PhaseQ", "Graphic EQ", "Limiter" };
+    for (int stage = 0; stage < MatchEngine::numStages; ++stage)
+        layout.add (std::make_unique<juce::AudioParameterBool> (juce::ParameterID { ParamIDs::stageBypass[stage], 1 },
+                                                                juce::String (stageNames[stage]) + " Bypass", false));
     return layout;
 }
 
@@ -154,14 +211,7 @@ void UlMaToProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Midi
     const int numChannels = juce::jmin (2, buffer.getNumChannels());
     bypassMix.setTargetValue (bypassParam->get() ? 1.0f : 0.0f);
 
-    Analog::Settings analog;
-    for (size_t b = 0; b < tapeParams.size(); ++b)
-        analog.tape[b] = tapeParams[b]->load() * 0.01f;
-    analog.wow         = wowParam->load() * 0.01f;
-    analog.flutter     = flutterParam->load() * 0.01f;
-    analog.crackle     = crackleParam->load() * 0.01f;
-    analog.tube        = tubeParam->load() * 0.01f;
-    analog.transformer = transformerParam->load() * 0.01f;
+    const auto stages = readStageSettings();
 
     // In chunks: keep the delayed input, process, mix (the engine keeps running when
     // bypassed, so switching back is seamless)
@@ -182,7 +232,7 @@ void UlMaToProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Midi
         }
 
         juce::AudioBuffer<float> chunk (buffer.getArrayOfWritePointers(), buffer.getNumChannels(), start, count);
-        engine.process (chunk, amountParam->load() * 0.01f, responseParam->load(), dynamicsParam->load() * 0.01f, analog);
+        engine.process (chunk, amountParam->load() * 0.01f, responseParam->load(), dynamicsParam->load() * 0.01f, stages);
 
         if (! bypassMix.isSmoothing() && bypassMix.getCurrentValue() == 0.0f)
             continue;
@@ -197,6 +247,41 @@ void UlMaToProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Midi
             }
         }
     }
+}
+
+MatchEngine::StageSettings UlMaToProcessor::readStageSettings() const
+{
+    MatchEngine::StageSettings s;
+    for (size_t b = 0; b < tapeParams.size(); ++b)
+        s.analog.tape[b] = tapeParams[b]->load() * 0.01f;
+    s.analog.wow         = wowParam->load() * 0.01f;
+    s.analog.flutter     = flutterParam->load() * 0.01f;
+    s.analog.crackle     = crackleParam->load() * 0.01f;
+    s.analog.tube        = tubeParam->load() * 0.01f;
+    s.analog.transformer = transformerParam->load() * 0.01f;
+
+    const auto value = [this] (const char* id) { return apvts.getRawParameterValue (id)->load(); };
+    for (size_t b = 0; b < (size_t) Tone::numBands; ++b)
+    {
+        s.eq.freq[b] = value (ParamIDs::eqFreq[b]);
+        s.eq.gain[b] = value (ParamIDs::eqGain[b]);
+        s.eq.q[b]    = value (ParamIDs::eqQ[b]);
+        s.phase.freq[b]   = value (ParamIDs::phaseFreq[b]);
+        s.phase.amount[b] = value (ParamIDs::phaseAmount[b]);
+        s.phase.width[b]  = value (ParamIDs::phaseWidth[b]);
+    }
+    s.phase.rotation = value (ParamIDs::phaseRotation);
+    s.phase.mode     = juce::roundToInt (value (ParamIDs::phaseMode));
+
+    s.limiter.on        = value (ParamIDs::limiterOn) > 0.5f;
+    s.limiter.truePeak  = value (ParamIDs::limiterTruePeak) > 0.5f;
+    s.limiter.inputDb   = value (ParamIDs::limiterInput);
+    s.limiter.ceilingDb = value (ParamIDs::limiterCeiling);
+    s.limiter.releaseMs = value (ParamIDs::limiterRelease);
+    s.limiter.link      = value (ParamIDs::limiterLink) * 0.01f;
+    for (size_t stage = 0; stage < s.bypass.size(); ++stage)
+        s.bypass[stage] = value (ParamIDs::stageBypass[stage]) > 0.5f;
+    return s;
 }
 
 //==============================================================================
@@ -226,20 +311,42 @@ juce::Range<double> UlMaToProcessor::getReferenceRange() const
 
 void UlMaToProcessor::setStageOrder (const MatchEngine::Order& order)
 {
-    apvts.state.setProperty (orderProperty, juce::String (order[0]) + juce::String (order[1]) + juce::String (order[2]), nullptr);
+    juce::String text;
+    for (int stage : order)
+        text << stage;
+    apvts.state.setProperty (orderProperty, text, nullptr);
     engine.setStageOrder (order);
 }
 
-// Stored as e.g. "012" (EQ, dynamics, analog); older versions only knew "dynamics first"
+// Stored as e.g. "012345". Older versions: three stages ("012", the new ones follow) or
+// only "dynamics first"
 MatchEngine::Order UlMaToProcessor::getStageOrder() const
 {
-    const auto text = apvts.state.getProperty (orderProperty).toString();
-    if (text.length() == 3 && text.containsOnly ("012") && text.containsChar ('0') && text.containsChar ('1') && text.containsChar ('2'))
-        return { (int) (text[0] - '0'), (int) (text[1] - '0'), (int) (text[2] - '0') };
+    auto text = apvts.state.getProperty (orderProperty).toString();
+    if (text.length() == 3)
+        text << "345";
+    else if (text.isEmpty() && (bool) apvts.state.getProperty (dynamicsFirstProperty, false))
+        text = "102345";
 
-    if ((bool) apvts.state.getProperty (dynamicsFirstProperty, false))
-        return { MatchEngine::dynamicsStage, MatchEngine::eqStage, MatchEngine::analogStage };
-    return { MatchEngine::eqStage, MatchEngine::dynamicsStage, MatchEngine::analogStage };
+    MatchEngine::Order order {};
+    std::array<bool, MatchEngine::numStages> used {};
+    if (text.length() == MatchEngine::numStages)
+    {
+        bool valid = true;
+        for (int i = 0; i < MatchEngine::numStages; ++i)
+        {
+            const int stage = (int) (text[i] - '0');
+            valid = valid && stage >= 0 && stage < MatchEngine::numStages && ! used[(size_t) stage];
+            if (valid)
+            {
+                used[(size_t) stage] = true;
+                order[(size_t) i] = stage;
+            }
+        }
+        if (valid)
+            return order;
+    }
+    return MatchEngine::defaultOrder();
 }
 
 Spectrum::Profile UlMaToProcessor::getReferenceProfile() const

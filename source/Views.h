@@ -629,6 +629,7 @@ private:
 //==============================================================================
 // Tabs of the stages in processing order (left = first, arrows = signal flow).
 // A click selects the page, dragging a tab moves the stage to where it is dropped.
+// The LED on each tab: lit = stage active, a click on it bypasses the stage.
 //==============================================================================
 class StageTabs final : public juce::Component
 {
@@ -639,13 +640,17 @@ public:
 
     std::function<void (int)>          onSelect;        // page = stage
     std::function<void (const Order&)> onOrderChange;
+    std::function<void (int)>          onBypassToggle;  // stage
 
-    void setState (int page, const Order& newOrder)
+    using Bypassed = std::array<bool, MatchEngine::numStages>;
+
+    void setState (int page, const Order& newOrder, const Bypassed& newBypassed)
     {
-        if (page != selected || newOrder != order)
+        if (page != selected || newOrder != order || newBypassed != bypassed)
         {
             selected = page;
             order = newOrder;
+            bypassed = newBypassed;
             repaint();
         }
     }
@@ -667,10 +672,14 @@ public:
             }
         }
 
-        g.setColour (Colours::text.withAlpha (0.55f));
-        g.setFont (juce::Font (juce::FontOptions (11.0f)));
-        g.drawText ("SIGNAL FLOW  -  drag a tab to change the order",
-                    getLocalBounds().toFloat().withTrimmedLeft (slotBounds (numSlots - 1).getRight() + 16.0f), juce::Justification::centredLeft);
+        // Hint, if there is room for it
+        const auto rest = getLocalBounds().toFloat().withTrimmedLeft (slotBounds (numSlots - 1).getRight() + 16.0f);
+        if (rest.getWidth() > 220.0f)
+        {
+            g.setColour (Colours::text.withAlpha (0.55f));
+            g.setFont (juce::Font (juce::FontOptions (11.0f)));
+            g.drawText ("SIGNAL FLOW  -  drag a tab to change the order", rest, juce::Justification::centredLeft);
+        }
 
         if (dragged >= 0)   // the dragged tab on top, where the mouse is
             drawTab (g, dragged, slotBounds (0).withX (juce::jlimit (0.0f, slotBounds (numSlots - 1).getX(), dragX)));
@@ -682,6 +691,12 @@ public:
         for (int slot = 0; slot < numSlots; ++slot)
             if (slotBounds (slot).contains (e.position))
             {
+                if (ledBounds (slotBounds (slot)).expanded (4.0f).contains (e.position))
+                {
+                    if (onBypassToggle != nullptr)
+                        onBypassToggle (order[(size_t) slot]);
+                    return;
+                }
                 pressed = order[(size_t) slot];
                 grabOffset = e.position.x - slotBounds (slot).getX();
             }
@@ -702,7 +717,7 @@ public:
         if (dragged >= 0)
         {
             // The slot nearest to where the tab was dropped
-            const int target = juce::jlimit (0, numSlots - 1, juce::roundToInt (dragX / (tabWidth + arrowGap)));
+            const int target = juce::jlimit (0, numSlots - 1, juce::roundToInt (dragX / (tabWidth() + arrowGap)));
             Order newOrder;
             int n = 0;
             for (int slot = 0; slot < numSlots; ++slot)   // the others keep their order around it
@@ -729,11 +744,19 @@ public:
 
 private:
     static constexpr int numSlots = MatchEngine::numStages;
-    static constexpr float tabWidth = 170.0f, arrowGap = 28.0f;
+    static constexpr float arrowGap = 22.0f;
+
+    // As wide as possible, at most 170 px
+    float tabWidth() const   { return juce::jmin (170.0f, ((float) getWidth() - (numSlots - 1) * arrowGap) / (float) numSlots); }
 
     juce::Rectangle<float> slotBounds (int slot) const
     {
-        return { (float) slot * (tabWidth + arrowGap), 0.0f, tabWidth, (float) getHeight() };
+        return { (float) slot * (tabWidth() + arrowGap), 0.0f, tabWidth(), (float) getHeight() };
+    }
+
+    static juce::Rectangle<float> ledBounds (juce::Rectangle<float> tab)
+    {
+        return juce::Rectangle<float> (12.0f, 12.0f).withCentre ({ tab.getRight() - 15.0f, tab.getCentreY() - 1.5f });
     }
 
     void drawTab (juce::Graphics& g, int page, juce::Rectangle<float> r) const
@@ -753,13 +776,27 @@ private:
         for (int i = 0; i < 3; ++i)
             g.fillRect (r.getX() + 10.0f + (float) i * 3.0f, r.getCentreY() - 7.0f, 1.2f, 12.0f);
 
-        static constexpr const char* names[] { "EQ MATCH", "DYNAMICS MATCH", "ANALOG HEAT" };
-        g.setColour (fg);
+        // Bypassed: faded name; LED: lit = active
+        const bool off = bypassed[(size_t) page];
+        static constexpr const char* names[] { "EQ MATCH", "DYNAMICS", "ANALOG HEAT", "PHASEQ", "GRAPHIC EQ", "LIMITER" };
+        g.setColour (fg.withAlpha (off ? 0.4f : 1.0f));
         g.setFont (juce::Font (juce::FontOptions (13.0f, juce::Font::bold)));
-        g.drawText (names[page], r.withTrimmedLeft (18.0f).withTrimmedBottom (3.0f), juce::Justification::centred);
+        g.drawText (names[page], r.withTrimmedLeft (18.0f).withTrimmedRight (22.0f).withTrimmedBottom (3.0f), juce::Justification::centred);
+
+        const auto led = ledBounds (r);
+        g.setColour (Colours::text);
+        g.fillEllipse (led);
+        g.setColour (off ? Colours::text.brighter (0.35f) : Colours::accent);
+        g.fillEllipse (led.reduced (2.0f));
+        if (! off)
+        {
+            g.setColour (juce::Colours::white.withAlpha (0.45f));
+            g.fillEllipse (led.reduced (4.0f).translated (-1.0f, -1.0f));
+        }
     }
 
-    Order order { 0, 1, 2 };
+    Order order = MatchEngine::defaultOrder();
+    Bypassed bypassed {};
     int selected = 0, pressed = -1, dragged = -1;
     float dragX = 0.0f, grabOffset = 0.0f;
 

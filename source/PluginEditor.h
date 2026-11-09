@@ -1,13 +1,16 @@
 #pragma once
 
-#include "Views.h"
+#include "ToneViews.h"
 
 //==============================================================================
 // Layout from top to bottom: header with BYPASS, reference song (waveform + ANALYZE,
-// LEARN), tabs (in processing order, can be dragged), then one of three pages:
-//  EQ MATCH       - the three analysis displays, the output spectrum, MATCH / RESPONSE
-//  DYNAMICS MATCH - level distributions per band, DYNAMICS knob
-//  ANALOG HEAT    - tape saturation per band, wow, flutter, crackle, tube, transformer
+// LEARN), tabs (in processing order, can be dragged), then one page per stage:
+//  EQ MATCH    - the three analysis displays, the output spectrum, MATCH / RESPONSE
+//  DYNAMICS    - level distributions per band, DYNAMICS knob
+//  ANALOG HEAT - tape saturation per band, wow, flutter, crackle, tube, transformer
+//  PHASEQ      - phase nodes, rotation, mode
+//  GRAPHIC EQ  - six band nodes
+//  LIMITER     - reduction / output history, input, ceiling, release, link
 //==============================================================================
 class UlMaToEditor final : public juce::AudioProcessorEditor,
                            private juce::Timer
@@ -22,6 +25,7 @@ public:
 private:
     void timerCallback() override;
     void showPage (int page);
+    StageTabs::Bypassed bypassedStages() const;
 
     UlMaToProcessor& processor;
     UlMaToLookAndFeel lookAndFeel;
@@ -67,6 +71,21 @@ private:
     std::array<LabelledKnob, Dynamics::numBands> tapeKnobs;
     std::array<LabelledKnob, 5> heatKnobs;   // wow, flutter, crackle, tube, transformer
     juce::Rectangle<int> tapePanel, transportPanel, outputPanel;
+
+    // PhaseQ, graphic EQ, limiter pages
+    PhaseQView phaseQView { processor };
+    LabelledKnob rotationKnob;
+    juce::ComboBox phaseModeBox;
+    juce::Label phaseModeLabel;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> phaseModeAttachment;
+
+    GraphicEqView graphicEqView { processor };
+
+    LimiterView limiterView { processor };
+    std::array<LabelledKnob, 4> limiterKnobs;   // input, ceiling, release, link
+    juce::TextButton limiterOnButton { "LIMITER ON" }, truePeakButton { "TRUE PEAK" };
+    juce::AudioProcessorValueTreeState::ButtonAttachment limiterOnAttachment { processor.apvts, ParamIDs::limiterOn, limiterOnButton },
+                                                         truePeakAttachment  { processor.apvts, ParamIDs::limiterTruePeak, truePeakButton };
 
     std::array<std::vector<juce::Component*>, MatchEngine::numStages> pages;
     juce::Rectangle<int> tabLine;

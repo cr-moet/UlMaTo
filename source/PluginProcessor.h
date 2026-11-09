@@ -18,6 +18,29 @@ namespace ParamIDs
     inline constexpr const char* crackle     = "crackle";
     inline constexpr const char* tube        = "tube";
     inline constexpr const char* transformer = "transformer";
+
+    // Graphic EQ: six bands
+    inline constexpr const char* eqFreq[] { "eqFreq1", "eqFreq2", "eqFreq3", "eqFreq4", "eqFreq5", "eqFreq6" };
+    inline constexpr const char* eqGain[] { "eqGain1", "eqGain2", "eqGain3", "eqGain4", "eqGain5", "eqGain6" };
+    inline constexpr const char* eqQ[]    { "eqQ1", "eqQ2", "eqQ3", "eqQ4", "eqQ5", "eqQ6" };
+
+    // PhaseQ: six nodes, rotation, mode
+    inline constexpr const char* phaseFreq[]   { "phaseFreq1", "phaseFreq2", "phaseFreq3", "phaseFreq4", "phaseFreq5", "phaseFreq6" };
+    inline constexpr const char* phaseAmount[] { "phaseAmount1", "phaseAmount2", "phaseAmount3", "phaseAmount4", "phaseAmount5", "phaseAmount6" };
+    inline constexpr const char* phaseWidth[]  { "phaseWidth1", "phaseWidth2", "phaseWidth3", "phaseWidth4", "phaseWidth5", "phaseWidth6" };
+    inline constexpr const char* phaseRotation = "phaseRotation";
+    inline constexpr const char* phaseMode     = "phaseMode";
+
+    // Limiter
+    inline constexpr const char* limiterOn       = "limiterOn";
+    inline constexpr const char* limiterTruePeak = "limiterTruePeak";
+    inline constexpr const char* limiterInput    = "limiterInput";
+    inline constexpr const char* limiterCeiling  = "limiterCeiling";
+    inline constexpr const char* limiterRelease  = "limiterRelease";
+    inline constexpr const char* limiterLink     = "limiterLink";
+
+    // Bypass per stage (MatchEngine::Stage order)
+    inline constexpr const char* stageBypass[] { "bypassEqMatch", "bypassDynamics", "bypassAnalog", "bypassPhaseQ", "bypassGraphicEq", "bypassLimiter" };
 }
 
 //==============================================================================
@@ -29,8 +52,9 @@ namespace ParamIDs
 // correction (learned input -> reference) followed by a dynamic one that follows
 // the music. The dynamics of the reference in five bands are matched by a multiband
 // compressor / expander with its own amount (DYNAMICS). ANALOG adds tape, wow/flutter,
-// vinyl crackle, a tube and a transformer stage. The three stages can run in any order.
-// See MatchEngine, Dynamics and Analog.
+// vinyl crackle, a tube and a transformer stage; PHASEQ changes only the phase, GRAPHIC EQ
+// is a linear-phase EQ, LIMITER a lookahead limiter. The six stages run in any order.
+// See MatchEngine, Dynamics, Analog, ToneStages and Limiter.
 // Bypass: cross-fade to the input, delayed by the latency.
 //==============================================================================
 class UlMaToProcessor final : public juce::AudioProcessor
@@ -99,6 +123,10 @@ public:
     void setStageOrder (const MatchEngine::Order& order);
     MatchEngine::Order getStageOrder() const;
 
+    // Limiter meters
+    float getLimiterReductionDb() const noexcept           { return engine.getLimiterReductionDb(); }
+    float getLimiterOutputDb() const noexcept              { return engine.getLimiterOutputDb(); }
+
     // Dynamics: live input / output distributions, slopes and current gain per band
     MatchEngine::DynamicsState getDynamicsState() const    { return engine.getDynamicsState(); }
     float getDynamicsGainDb (int band) const noexcept      { return engine.getDynamicsGainDb (band); }
@@ -121,6 +149,9 @@ private:
     std::atomic<float>* crackleParam = nullptr;
     std::atomic<float>* tubeParam = nullptr;
     std::atomic<float>* transformerParam = nullptr;
+
+    // Settings of the other stages, read from the parameters for every block
+    MatchEngine::StageSettings readStageSettings() const;
 
     // Bypass: the input delayed by the latency, cross-fade over 20 ms
     juce::AudioBuffer<float> dryDelay, dryBlock;

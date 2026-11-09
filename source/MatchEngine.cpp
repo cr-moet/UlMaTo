@@ -256,6 +256,21 @@ void MatchEngine::prepare (double newSampleRate, int)
     output.withDynamics = true;
     learnDynamics.prepare (sampleRate);
     analog.prepare (sampleRate, blockSize);
+    phaseFilter.prepare (blockSize, firLength);
+    graphicFilter.prepare (blockSize, firLength);
+    designedPhase = {};
+    designedEq = {};
+    limiter.prepare (sampleRate);
+    for (int stage = 0; stage < numStages; ++stage)
+    {
+        auto& b = bypass[(size_t) stage];
+        b.l.assign ((size_t) stageLatency (stage), 0.0f);
+        b.r.assign ((size_t) stageLatency (stage), 0.0f);
+        b.position = 0;
+        b.mix = bypassRequest[(size_t) stage] ? 0.0f : 1.0f;
+    }
+    dryL.assign ((size_t) blockSize, 0.0f);
+    dryR.assign ((size_t) blockSize, 0.0f);
     orderCode = orderRequest.load();
     switchGain = 1.0f;
     switchStep = 1.0f / (float) (sampleRate * 0.01);
@@ -352,7 +367,7 @@ Spectrum::Profile MatchEngine::getOutputProfile() const
 
 //==============================================================================
 void MatchEngine::process (juce::AudioBuffer<float>& buffer, float amount, float response, float dynamicsAmount,
-                           const Analog::Settings& analogNow) noexcept
+                           const StageSettings& stages) noexcept
 {
     const int numSamples = buffer.getNumSamples();
     if (! prepared || numSamples == 0 || buffer.getNumChannels() == 0)
@@ -361,7 +376,11 @@ void MatchEngine::process (juce::AudioBuffer<float>& buffer, float amount, float
     currentAmount.store (amount, std::memory_order_relaxed);
     currentResponse.store (response, std::memory_order_relaxed);
     currentDynamicsAmount.store (dynamicsAmount, std::memory_order_relaxed);
-    analogSettings = analogNow;
+    analogSettings  = stages.analog;
+    limiterSettings = stages.limiter;
+    bypassRequest   = stages.bypass;
+    phaseShared.set (stages.phase);
+    eqShared.set (stages.eq);
 
     float* left  = buffer.getWritePointer (0);
     float* right = buffer.getNumChannels() > 1 ? buffer.getWritePointer (1) : left;
@@ -389,7 +408,7 @@ void MatchEngine::process (juce::AudioBuffer<float>& buffer, float amount, float
                 {
                     switchGain = 0.0f;
                     orderCode = requested;
-                    switchMute = getLatencySamples() + firLength;
+                    switchMute = getLatencySamples() + 3 * firLength;   // also the history of the three filter stages
                 }
             }
             else
@@ -415,11 +434,44 @@ void MatchEngine::process (juce::AudioBuffer<float>& buffer, float amount, float
         buffer.clear (ch, 0, numSamples);
 }
 
+int MatchEngine::stageLatency (int stage) const noexcept
+{
+    switch (stage)
+    {
+        case eqStage:        return firLength / 2;
+        case dynamicsStage:  return lookahead;
+        case analogStage:    return analog.getLatencySamples();
+        case phaseStage:     return phaseFilter.getLatencySamples();
+        case graphicEqStage: return graphicFilter.getLatencySamples();
+        default:             return limiter.getLatencySamples();
+    }
+}
+
 // The stages on one block (blockL/R, in place), in the selected order
 void MatchEngine::processBlock() noexcept
 {
+    const float mixStep = (float) blockSize / (float) (sampleRate * 0.02);   // bypass cross-fade: 20 ms
+
     for (int stage : decode (orderCode))
     {
+        // The stage input, delayed by its latency (always kept, so bypass can start any time)
+        auto& by = bypass[(size_t) stage];
+        const auto length = by.l.size();
+        for (size_t j = 0; j < (size_t) blockSize; ++j)
+        {
+            if (length == 0)
+            {
+                dryL[j] = blockL[j];
+                dryR[j] = blockR[j];
+                continue;
+            }
+            dryL[j] = by.l[(size_t) by.position];
+            dryR[j] = by.r[(size_t) by.position];
+            by.l[(size_t) by.position] = blockL[j];
+            by.r[(size_t) by.position] = blockR[j];
+            by.position = (by.position + 1) % (int) length;
+        }
+
         if (stage == eqStage)
         {
             // New filters from the engine thread: cross-fade within this block
@@ -450,9 +502,27 @@ void MatchEngine::processBlock() noexcept
                 delayPosition = (delayPosition + 1) % lookahead;
             }
         }
-        else
-        {
+        else if (stage == analogStage)
             analog.process (blockL.data(), blockR.data(), blockSize, analogSettings);
+        else if (stage == phaseStage)
+            phaseFilter.process (blockL.data(), blockR.data());
+        else if (stage == graphicEqStage)
+            graphicFilter.process (blockL.data(), blockR.data());
+        else
+            limiter.process (blockL.data(), blockR.data(), blockSize, limiterSettings);
+
+        // Bypass: ramp over the block towards the target
+        const float target = bypassRequest[(size_t) stage] ? 0.0f : 1.0f;
+        if (by.mix != 1.0f || target != 1.0f)
+        {
+            const float start = by.mix, end = start + juce::jlimit (-mixStep, mixStep, target - start);
+            for (size_t j = 0; j < (size_t) blockSize; ++j)
+            {
+                const float mix = start + (end - start) * (float) (j + 1) / (float) blockSize;
+                blockL[j] = dryL[j] + mix * (blockL[j] - dryL[j]);
+                blockR[j] = dryR[j] + mix * (blockR[j] - dryR[j]);
+            }
+            by.mix = end;
         }
     }
 
@@ -485,6 +555,7 @@ void MatchEngine::run()
         {
             updateFilters (juce::jmin (elapsed, 0.5));
             updateDynamicsMatch();
+            updateToneStages();
             lastUpdate = now;
             lastAmount = amount;
         }
@@ -622,6 +693,20 @@ void MatchEngine::updateDynamic (const Spectrum::Profile& ref, const Spectrum::P
                 live.side[b], fastSide[b], longSide[b], speed, sideUpPerSec, sideDownPerSec);
     }
     longTermValid = true;
+}
+
+// PhaseQ and graphic EQ: new filters when their settings have changed
+void MatchEngine::updateToneStages()
+{
+    const auto phase = phaseShared.get();
+    if (phase.freq[0] > 0.0f && phase != designedPhase
+         && phaseFilter.update (sampleRate, [&phase] (float f) { return Tone::phaseResponse (phase, f); }))
+        designedPhase = phase;
+
+    const auto eq = eqShared.get();
+    if (eq.freq[0] > 0.0f && eq != designedEq
+         && graphicFilter.update (sampleRate, [&eq] (float f) { return Tone::eqResponse (eq, f); }))
+        designedEq = eq;
 }
 
 // Dynamics: slope per band from the reference range and the input range (of the learned
