@@ -411,6 +411,204 @@ private:
 };
 
 //==============================================================================
+// Dynamics page: one column per band with the level distributions (relative to their
+// own median, so only the shape - the dynamics - is compared), the dynamic ranges,
+// the ratio and the current gain of the multiband stage
+//==============================================================================
+class DynamicsView final : public juce::Component,
+                           private juce::Timer
+{
+public:
+    explicit DynamicsView (UlMaToProcessor& p) : processor (p)  { startTimerHz (20); }
+
+    void paint (juce::Graphics& g) override
+    {
+        auto area = getLocalBounds().toFloat();
+
+        // Legend
+        auto legend = area.removeFromTop (18.0f);
+        g.setFont (juce::Font (juce::FontOptions (12.0f, juce::Font::bold)));
+        g.setColour (Colours::text);
+        g.drawText ("DYNAMICS PER BAND  (level distribution around the median)", legend, juce::Justification::centredLeft);
+        Plot::drawLegend (g, legend.translated (0.0f, -3.0f), { { "OUTPUT", Colours::accent }, { "   INPUT", Colours::text.withAlpha (0.45f) },
+                                                                { "   - - REFERENCE", Colours::text } });
+        area.removeFromTop (6.0f);
+
+        const float gap = 12.0f, w = (area.getWidth() - gap * (Dynamics::numBands - 1)) / (float) Dynamics::numBands;
+        for (size_t b = 0; b < (size_t) Dynamics::numBands; ++b)
+        {
+            paintBand (g, b, area.removeFromLeft (w));
+            area.removeFromLeft (gap);
+        }
+
+        if (! reference.valid)
+        {
+            g.setColour (Colours::text.withAlpha (0.6f));
+            g.setFont (juce::Font (juce::FontOptions (13.0f)));
+            g.drawText ("Press ANALYZE to measure the dynamics of the reference", getLocalBounds().withTrimmedTop (60).removeFromTop (20),
+                        juce::Justification::centred);
+        }
+    }
+
+    void setReference (const Dynamics::Profile& p)   { reference = p; repaint(); }
+
+private:
+    static constexpr float lowest = -30.0f, highest = 18.0f;   // dB around the median
+
+    void paintBand (juce::Graphics& g, size_t b, juce::Rectangle<float> r)
+    {
+        g.setColour (Colours::text);
+        g.setFont (juce::Font (juce::FontOptions (12.0f, juce::Font::bold)));
+        g.drawText (Dynamics::bandNames[b], r.removeFromTop (16.0f), juce::Justification::centredLeft);
+        g.setColour (Colours::text.withAlpha (0.6f));
+        g.setFont (juce::Font (juce::FontOptions (11.0f)));
+        g.drawText (Dynamics::bandRanges[b], r.removeFromTop (14.0f), juce::Justification::centredLeft);
+        r.removeFromTop (4.0f);
+
+        // Distributions
+        auto info = r.removeFromBottom (92.0f);
+        const auto plot = r.withTrimmedBottom (14.0f);
+        Plot::drawPanel (g, plot);
+        g.setFont (juce::Font (juce::FontOptions (10.0f)));
+        for (float db : { -24.0f, -12.0f, 0.0f, 12.0f })
+        {
+            const float x = plot.getX() + plot.getWidth() * (db - lowest) / (highest - lowest);
+            g.setColour (db == 0.0f ? Colours::text.withAlpha (0.3f) : Colours::grid);
+            g.drawVerticalLine ((int) x, plot.getY(), plot.getBottom());
+            g.setColour (Colours::text.withAlpha (0.6f));
+            g.drawText ((db > 0.0f ? "+" : "") + juce::String ((int) db), juce::Rectangle<float> (x - 15.0f, plot.getBottom() + 1.0f, 30.0f, 12.0f),
+                        juce::Justification::centred);
+        }
+
+        const auto& input = state.fromLearned ? learned : state.input;
+        drawDistribution (g, plot, input, b, Colours::text.withAlpha (0.12f), true, false);
+        drawDistribution (g, plot, state.output, b, Colours::accent, false, false);
+        drawDistribution (g, plot, reference, b, Colours::text, false, true);
+
+        // Ranges, ratio, gain
+        info.removeFromTop (6.0f);
+        const auto row = [&] (const juce::String& label, const juce::String& value, juce::Colour colour)
+        {
+            auto line = info.removeFromTop (16.0f);
+            g.setColour (Colours::text.withAlpha (0.7f));
+            g.setFont (juce::Font (juce::FontOptions (11.0f)));
+            g.drawText (label, line, juce::Justification::centredLeft);
+            g.setColour (colour);
+            g.setFont (juce::Font (juce::FontOptions (11.0f, juce::Font::bold)));
+            g.drawText (value, line, juce::Justification::centredRight);
+        };
+        const auto range = [b] (const Dynamics::Profile& p)
+        {
+            return p.valid && p.active[b] ? juce::String (p.range[b], 1) + " dB" : juce::String ("-");
+        };
+        row ("RANGE REFERENCE", range (reference), Colours::text);
+        row (state.fromLearned ? "RANGE INPUT (LEARNED)" : "RANGE INPUT", range (input), Colours::text.withAlpha (0.7f));
+        row ("RANGE OUTPUT", range (state.output), Colours::accent);
+
+        const float slope = state.slope[b];
+        row ("RATIO", std::abs (slope - 1.0f) < 0.01f ? juce::String ("1 : 1")
+                      : slope < 1.0f ? juce::String (1.0f / slope, 2) + " : 1"
+                                     : "1 : " + juce::String (slope, 2) + "  EXP", Colours::text);
+
+        // Gain meter: -12 ... +12 dB from the centre
+        info.removeFromTop (6.0f);
+        auto meter = info.removeFromTop (14.0f);
+        g.setColour (Colours::panel);
+        g.fillRect (meter);
+        g.setColour (Colours::text.withAlpha (0.5f));
+        g.drawRect (meter, 1.0f);
+        const float centre = meter.getCentreX(), x = centre + meter.getWidth() * 0.5f * juce::jlimit (-1.0f, 1.0f, gains[b] / 12.0f);
+        g.setColour (Colours::accent);
+        g.fillRect (juce::Rectangle<float>::leftTopRightBottom (juce::jmin (centre, x), meter.getY() + 2.0f,
+                                                                juce::jmax (centre, x), meter.getBottom() - 2.0f));
+        g.setColour (Colours::text);
+        g.drawVerticalLine ((int) centre, meter.getY(), meter.getBottom());
+        g.setFont (juce::Font (juce::FontOptions (10.0f, juce::Font::bold)));
+        g.drawText ((gains[b] >= 0.0f ? "+" : "") + juce::String (gains[b], 1) + " dB", meter.reduced (4.0f, 0.0f),
+                    gains[b] < 0.0f ? juce::Justification::centredRight : juce::Justification::centredLeft);
+    }
+
+    // Histogram of one band, shifted by its median, slightly smoothed, scaled to its maximum
+    static void drawDistribution (juce::Graphics& g, juce::Rectangle<float> plot, const Dynamics::Profile& p, size_t b,
+                                  juce::Colour colour, bool filled, bool dashed)
+    {
+        if (! p.valid || ! p.active[b])
+            return;
+
+        const auto& h = p.histogram[b];
+        Dynamics::Histogram smoothed {};
+        float peak = 0.0f;
+        for (int i = 0; i < Dynamics::histogramSize; ++i)
+        {
+            float sum = 0.0f;
+            for (int k = juce::jmax (0, i - 2); k <= juce::jmin (Dynamics::histogramSize - 1, i + 2); ++k)
+                sum += h[(size_t) k];
+            peak = juce::jmax (peak, smoothed[(size_t) i] = sum);
+        }
+        if (peak <= 0.0f)
+            return;
+
+        juce::Path path;
+        bool started = false;
+        for (int i = 0; i < Dynamics::histogramSize; ++i)
+        {
+            const float db = Dynamics::binLevel ((float) i) - p.median[b];
+            if (db < lowest || db > highest)
+                continue;
+            const juce::Point<float> pt { plot.getX() + plot.getWidth() * (db - lowest) / (highest - lowest),
+                                          plot.getBottom() - (plot.getHeight() - 6.0f) * smoothed[(size_t) i] / peak };
+            if (! started) { path.startNewSubPath (pt); started = true; } else path.lineTo (pt);
+        }
+        if (! started)
+            return;
+
+        g.setColour (colour);
+        if (filled)
+        {
+            const auto end = path.getCurrentPosition();
+            const auto bounds = path.getBounds();
+            path.lineTo (end.x, plot.getBottom());
+            path.lineTo (bounds.getX(), plot.getBottom());
+            path.closeSubPath();
+            g.fillPath (path);
+        }
+        else if (dashed)
+        {
+            const float dashes[] { 5.0f, 4.0f };
+            juce::Path d;
+            juce::PathStrokeType (1.4f).createDashedStroke (d, path, dashes, 2);
+            g.fillPath (d);
+        }
+        else
+            g.strokePath (path, juce::PathStrokeType (1.8f));
+    }
+
+    void timerCallback() override
+    {
+        if (! isShowing())
+            return;
+
+        if (++slowTicks >= 10)   // distributions twice a second, gains 20 times
+        {
+            slowTicks = 0;
+            state = processor.getDynamicsState();
+            learned = processor.getLearnedDynamics();
+        }
+        for (size_t b = 0; b < (size_t) Dynamics::numBands; ++b)
+            gains[b] += 0.4f * (processor.getDynamicsGainDb ((int) b) - gains[b]);
+        repaint();
+    }
+
+    UlMaToProcessor& processor;
+    MatchEngine::DynamicsState state;
+    Dynamics::Profile reference, learned;
+    Dynamics::Values gains {};
+    int slowTicks = 10;
+
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (DynamicsView)
+};
+
+//==============================================================================
 // Status LED: off, blinking (busy) or on
 //==============================================================================
 class Led final : public juce::Component,

@@ -27,6 +27,10 @@ namespace
     constexpr double fastSeconds   = 0.15;     // time constant of the current level
     constexpr double longSeconds   = 10.0;     // time constant of the long-term level
 
+    // Dynamics: live level distributions cover about the last 15 s
+    const double dynamicsDecay = std::exp (-1.0 / (15.0 * Dynamics::readingsPerSecond));
+    constexpr float minSlope = 0.4f, maxSlope = 2.5f;   // at most 2.5:1 compression / 1:2.5 expansion
+
     float powerGain (float db)   { return std::pow (10.0f, db * 0.1f); }
 
     // 0 at or below 'from' Hz, 1 at or above 'to' Hz, logarithmic in between
@@ -161,6 +165,7 @@ void MatchEngine::Tap::reset()
     frame.clear();
     newSamples = 0;
     analyser.reset();
+    dynamics.reset();
 }
 
 void MatchEngine::Tap::push (const float* l, const float* r, int numSamples) noexcept
@@ -174,7 +179,7 @@ void MatchEngine::Tap::push (const float* l, const float* r, int numSamples) noe
     }
 }
 
-void MatchEngine::Tap::read (double decay, double fastDecay, Spectrum::Analyser* alsoTo)
+void MatchEngine::Tap::read (double decay, double fastDecay, Spectrum::Analyser* alsoTo, Dynamics::Analyser* alsoToDynamics)
 {
     constexpr int size = Spectrum::Analyser::size, hop = Spectrum::Analyser::hop;
 
@@ -189,6 +194,13 @@ void MatchEngine::Tap::read (double decay, double fastDecay, Spectrum::Analyser*
             if (scope.blockSize1 > 0) juce::FloatVectorOperations::copy (dest, fifoBuffer.getReadPointer (ch, scope.startIndex1), scope.blockSize1);
             if (scope.blockSize2 > 0) juce::FloatVectorOperations::copy (dest + scope.blockSize1, fifoBuffer.getReadPointer (ch, scope.startIndex2), scope.blockSize2);
         }
+
+        // Dynamics: every sample; the live distribution covers about the last 15 s
+        const float* newL = frame.getReadPointer (0, size - hop + newSamples);
+        const float* newR = frame.getReadPointer (1, size - hop + newSamples);
+        dynamics.process (newL, newR, count, dynamicsDecay);
+        if (alsoToDynamics != nullptr)
+            alsoToDynamics->process (newL, newR, count);
 
         if ((newSamples += count) < hop)
             continue;
@@ -235,6 +247,10 @@ void MatchEngine::prepare (double newSampleRate, int)
                                                               juce::dsp::WindowingFunction<float>::blackman, false);
 
     convolver.prepare (blockSize, firLength);
+    dynamics.prepare (sampleRate);
+    input.dynamics.prepare (sampleRate);
+    output.dynamics.prepare (sampleRate);
+    learnDynamics.prepare (sampleRate);
 
     // Both slots start neutral (pure delay)
     applied = {};
@@ -292,6 +308,33 @@ Spectrum::Profile MatchEngine::getLearned() const
     return learned;
 }
 
+void MatchEngine::setReferenceDynamics (const Dynamics::Profile& p)
+{
+    const juce::ScopedLock lock (stateLock);
+    referenceDynamics = p;
+}
+
+void MatchEngine::setLearnedDynamics (const Dynamics::Profile& p)
+{
+    {
+        const juce::ScopedLock lock (stateLock);
+        learnedDynamics = p;
+    }
+    ++learnedVersion;
+}
+
+Dynamics::Profile MatchEngine::getLearnedDynamics() const
+{
+    const juce::ScopedLock lock (stateLock);
+    return learnedDynamics;
+}
+
+MatchEngine::DynamicsState MatchEngine::getDynamicsState() const
+{
+    const juce::ScopedLock lock (stateLock);
+    return dynamicsState;
+}
+
 Spectrum::Profile MatchEngine::getOutputProfile() const
 {
     const juce::ScopedLock lock (stateLock);
@@ -299,7 +342,7 @@ Spectrum::Profile MatchEngine::getOutputProfile() const
 }
 
 //==============================================================================
-void MatchEngine::process (juce::AudioBuffer<float>& buffer, float amount, float response) noexcept
+void MatchEngine::process (juce::AudioBuffer<float>& buffer, float amount, float response, float dynamicsAmount) noexcept
 {
     const int numSamples = buffer.getNumSamples();
     if (! prepared || numSamples == 0 || buffer.getNumChannels() == 0)
@@ -307,6 +350,7 @@ void MatchEngine::process (juce::AudioBuffer<float>& buffer, float amount, float
 
     currentAmount.store (amount, std::memory_order_relaxed);
     currentResponse.store (response, std::memory_order_relaxed);
+    currentDynamicsAmount.store (dynamicsAmount, std::memory_order_relaxed);
 
     float* left  = buffer.getWritePointer (0);
     float* right = buffer.getNumChannels() > 1 ? buffer.getWritePointer (1) : left;
@@ -319,9 +363,12 @@ void MatchEngine::process (juce::AudioBuffer<float>& buffer, float amount, float
 
     for (int i = 0; i < numSamples; ++i)
     {
+        // Dynamics: detector on the input now, gain on the delayed signal
         const auto d = (size_t) delayPosition, b = (size_t) blockPosition;
-        blockL[b] = delayL[d];
-        blockR[b] = delayR[d];
+        float l = delayL[d], r = delayR[d];
+        dynamics.process (left[i], right[i], l, r);
+        blockL[b] = l;
+        blockR[b] = r;
         delayL[d] = left[i];
         delayR[d] = right[i];
         delayPosition = (delayPosition + 1) % lookahead;
@@ -369,7 +416,8 @@ void MatchEngine::run()
         // Exponential averaging per frame with the selected time constant
         const double frameSeconds = Spectrum::Analyser::hop / sampleRate;
         const double decay = std::exp (-frameSeconds / juce::jmax (0.05, (double) currentResponse.load()));
-        input.read (decay, std::exp (-frameSeconds / fastSeconds), learning.load() ? &learnAnalyser : nullptr);
+        input.read (decay, std::exp (-frameSeconds / fastSeconds), learning.load() ? &learnAnalyser : nullptr,
+                    learning.load() ? &learnDynamics : nullptr);
         output.read (decay, 0.0);
 
         const auto now = juce::Time::getMillisecondCounterHiRes();
@@ -379,6 +427,7 @@ void MatchEngine::run()
         if (elapsed >= updateSeconds || std::abs (amount - lastAmount) > 0.002f || profilesChanged.load())
         {
             updateFilters (juce::jmin (elapsed, 0.5));
+            updateDynamicsMatch();
             lastUpdate = now;
             lastAmount = amount;
         }
@@ -395,9 +444,16 @@ void MatchEngine::updateLearning()
         return;
 
     if (wanted)
+    {
         learnAnalyser.reset();
+        learnDynamics.reset();
+    }
     else if (learnAnalyser.hasData())
+    {
+        if (learnDynamics.hasData())
+            setLearnedDynamics (learnDynamics.getProfile());
         setLearned (learnAnalyser.getProfile (sampleRate));
+    }
 
     learning = wanted;
 }
@@ -509,6 +565,43 @@ void MatchEngine::updateDynamic (const Spectrum::Profile& ref, const Spectrum::P
                 live.side[b], fastSide[b], longSide[b], speed, sideUpPerSec, sideDownPerSec);
     }
     longTermValid = true;
+}
+
+// Dynamics: slope per band = reference range / input range (from the learned input if
+// there is one, otherwise from the live input), scaled by the dynamics amount; the pivot
+// is always the live median, so a changed input level does not matter.
+void MatchEngine::updateDynamicsMatch()
+{
+    DynamicsState state;
+    Dynamics::Profile ref, learnedInput;
+    {
+        const juce::ScopedLock lock (stateLock);
+        ref = referenceDynamics;
+        learnedInput = learnedDynamics;
+    }
+
+    if (input.dynamics.hasData (2.0))
+        state.input = input.dynamics.getProfile();
+    if (output.dynamics.hasData (2.0))
+        state.output = output.dynamics.getProfile();
+
+    state.fromLearned = learnedInput.valid;
+    const auto& in = learnedInput.valid ? learnedInput : state.input;
+    const float amount = currentDynamicsAmount.load (std::memory_order_relaxed);
+
+    Dynamics::Values pivot {};
+    for (size_t b = 0; b < (size_t) Dynamics::numBands; ++b)
+    {
+        state.slope[b] = 1.0f;
+        pivot[b] = state.input.median[b];
+        if (ref.valid && state.input.valid && ref.active[b] && in.active[b] && state.input.active[b]
+             && ref.range[b] > 0.3f && in.range[b] > 0.3f)
+            state.slope[b] = std::pow (juce::jlimit (minSlope, maxSlope, ref.range[b] / in.range[b]), amount);
+    }
+    dynamics.setTargets (state.slope, pivot);
+
+    const juce::ScopedLock lock (stateLock);
+    dynamicsState = state;
 }
 
 // Linear-phase 2x2 filter matrix from the correction curves:

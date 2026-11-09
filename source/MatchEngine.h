@@ -2,6 +2,7 @@
 
 #include "Spectrum.h"
 #include "MatrixConvolver.h"
+#include "Dynamics.h"
 #include <complex>
 
 //==============================================================================
@@ -14,8 +15,10 @@
 //                Bands that drop out or return are held until the analysis has caught
 //                up, boosts change slowly and cuts quickly, so returning bass does not
 //                pump or overshoot.
-// Both are combined into one 2x2 filter matrix (one convolution stage). The audio
-// runs 10 ms behind the analysis (lookahead).
+// Both are combined into one 2x2 filter matrix (one convolution stage). Before it sits
+// the multiband dynamics stage (Dynamics::Matcher), which maps the dynamic range of the
+// input (learned or live) per band to the one of the reference. The audio runs 10 ms
+// behind the analysis and the level detectors (lookahead).
 //
 // Audio thread  - process(): hands input/output to the engine thread, applies the filters.
 // Engine thread - analysis, learning, correction and filter design (about every 40 ms);
@@ -39,14 +42,29 @@ public:
     int getLatencySamples() const noexcept   { return lookahead + blockSize + firLength / 2; }
 
     // Audio thread. amount = 0 ... 1 (0 = no correction, signal only delayed),
-    // response = time constant of the live analysis in seconds
-    void process (juce::AudioBuffer<float>& buffer, float amount, float response) noexcept;
+    // response = time constant of the live analysis in seconds,
+    // dynamicsAmount = 0 ... 1 (0 = dynamics stage off)
+    void process (juce::AudioBuffer<float>& buffer, float amount, float response, float dynamicsAmount) noexcept;
 
     // Profiles (any thread except audio)
     void setReference (const Spectrum::Profile& reference);
     void setLearned (const Spectrum::Profile& learned);
     Spectrum::Profile getLearned() const;
     Spectrum::Profile getOutputProfile() const;   // processed signal, for the display
+
+    // Dynamics (any thread except audio)
+    void setReferenceDynamics (const Dynamics::Profile& reference);
+    void setLearnedDynamics (const Dynamics::Profile& learned);
+    Dynamics::Profile getLearnedDynamics() const;
+
+    struct DynamicsState
+    {
+        Dynamics::Profile input, output;   // live input (last ~15 s), processed signal
+        Dynamics::Values slope {};         // applied slope per band (output range / input range)
+        bool fromLearned = false;          // input range taken from the learned input
+    };
+    DynamicsState getDynamicsState() const;
+    float getDynamicsGainDb (int band) const noexcept   { return dynamics.getGainDb ((size_t) band); }
 
     // LEARN: start / stop the analysis of the input (the result follows a moment later)
     void setLearning (bool shouldLearn) noexcept   { learnRequest = shouldLearn; }
@@ -70,10 +88,12 @@ private:
         juce::AudioBuffer<float> frame { 2, Spectrum::Analyser::size };
         int newSamples = 0;
         Spectrum::Analyser analyser;
+        Dynamics::Analyser dynamics;
 
         void reset();
         void push (const float* l, const float* r, int numSamples) noexcept;   // audio thread
-        void read (double decay, double fastDecay, Spectrum::Analyser* alsoTo = nullptr);   // engine thread
+        void read (double decay, double fastDecay, Spectrum::Analyser* alsoTo = nullptr,
+                   Dynamics::Analyser* alsoToDynamics = nullptr);              // engine thread
     };
 
     void run() override;
@@ -82,15 +102,17 @@ private:
     void updateDynamic (const Spectrum::Profile& ref, const Spectrum::Profile& live,
                         const Spectrum::Curve& fastMid, const Spectrum::Curve& fastSide, double seconds);
     void designFilters (const Correction& c, MatrixConvolver::Filters& filters);
+    void updateDynamicsMatch();
 
     double sampleRate = 48000.0;
     int firLength = 4096, lookahead = 480;
 
-    std::atomic<float> currentAmount { 0.0f }, currentResponse { 1.0f };
+    std::atomic<float> currentAmount { 0.0f }, currentResponse { 1.0f }, currentDynamicsAmount { 0.0f };
     Tap input, output;
 
     // Learning (engine thread)
     Spectrum::Analyser learnAnalyser;
+    Dynamics::Analyser learnDynamics;
     std::atomic<bool> learnRequest { false }, learning { false };
     std::atomic<int> learnedVersion { 0 };
 
@@ -113,6 +135,7 @@ private:
 
     // Audio thread: lookahead delay, block buffering, convolution
     MatrixConvolver convolver;
+    Dynamics::Matcher dynamics;
     juce::AudioBuffer<float> delayLine;
     int delayPosition = 0;
     std::vector<float> blockL, blockR, outL, outR;
@@ -122,6 +145,8 @@ private:
     // Shared with the GUI / message thread
     mutable juce::CriticalSection stateLock;
     Spectrum::Profile reference, learned, outputProfile;
+    Dynamics::Profile referenceDynamics, learnedDynamics;
+    DynamicsState dynamicsState;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (MatchEngine)
 };

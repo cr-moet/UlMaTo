@@ -1,0 +1,387 @@
+#pragma once
+
+#include <juce_dsp/juce_dsp.h>
+
+//==============================================================================
+// Dynamics in five bands: analysis (level distribution per band) and matching.
+//
+// The level of each band is followed by a detector (attack 5 ms, release by band).
+// Its readings (100 per second) form a histogram per band, from which follow the
+// median level and the dynamic range (95th minus 10th percentile, quiet passages
+// more than 30 dB below the average are ignored).
+//
+// Matching: the level of each band is mapped around its median so that its range
+// becomes the range of the reference - compression where the input is more dynamic,
+// expansion where it is flatter. Both channels get the same gain (no image shift).
+//==============================================================================
+namespace Dynamics
+{
+    constexpr int numBands = 5;
+    inline constexpr float crossovers[numBands - 1] { 120.0f, 600.0f, 1200.0f, 9000.0f };
+    inline constexpr const char* bandNames[numBands]  { "SUB", "LOW MID", "MID", "HIGH MID", "AIR" };
+    inline constexpr const char* bandRanges[numBands] { "0 - 120 Hz", "120 - 600 Hz", "600 Hz - 1.2 kHz",
+                                                        "1.2 - 9 kHz", "9 - 22 kHz" };
+    using Values = std::array<float, numBands>;
+
+    constexpr float attackMs = 5.0f;
+    inline constexpr float releaseMs[numBands] { 160.0f, 110.0f, 80.0f, 60.0f, 50.0f };
+    constexpr double readingsPerSecond = 100.0;
+
+    // Histogram of the band levels: 0.5 dB steps from -100 dBFS
+    constexpr float histogramMin = -100.0f, histogramStep = 0.5f;
+    constexpr int histogramSize = 212;
+    using Histogram = std::array<float, histogramSize>;
+
+    inline float binLevel (float bin)   { return histogramMin + (bin + 0.5f) * histogramStep; }
+
+    struct Profile
+    {
+        std::array<Histogram, numBands> histogram {};   // weights (any scale)
+        Values median {}, range {};                     // dB
+        std::array<bool, numBands> active {};           // band has enough signal
+        bool valid = false;
+
+        // Median and range from the histograms
+        void evaluate()
+        {
+            valid = false;
+            for (size_t b = 0; b < (size_t) numBands; ++b)
+            {
+                const auto& h = histogram[b];
+                double total = 0.0, energy = 0.0;
+                for (int i = 0; i < histogramSize; ++i)
+                {
+                    total  += h[(size_t) i];
+                    energy += h[(size_t) i] * std::pow (10.0, binLevel ((float) i) * 0.1);
+                }
+
+                active[b] = false;
+                median[b] = range[b] = 0.0f;
+                if (total <= 0.0)
+                    continue;
+
+                // Gate: 30 dB below the energy average (and above -80 dBFS)
+                const float gate = juce::jmax (-80.0f, (float) (10.0 * std::log10 (energy / total)) - 30.0f);
+                const int first = juce::jlimit (0, histogramSize - 1, (int) ((gate - histogramMin) / histogramStep));
+
+                double gated = 0.0;
+                for (int i = first; i < histogramSize; ++i)
+                    gated += h[(size_t) i];
+                if (gated <= total * 0.05)
+                    continue;
+
+                // Percentile with linear interpolation inside the bin
+                const auto percentile = [&] (double p)
+                {
+                    const double target = p * gated;
+                    double sum = 0.0;
+                    for (int i = first; i < histogramSize; ++i)
+                    {
+                        const double w = h[(size_t) i];
+                        if (sum + w >= target && w > 0.0)
+                            return histogramMin + ((float) i + (float) ((target - sum) / w)) * histogramStep;
+                        sum += w;
+                    }
+                    return binLevel ((float) (histogramSize - 1));
+                };
+
+                median[b] = percentile (0.5);
+                range[b]  = percentile (0.95) - percentile (0.10);
+                active[b] = true;
+                valid = true;
+            }
+        }
+    };
+
+    //==========================================================================
+    // Five bands from Linkwitz-Riley crossovers (4th order). With 'compensate' the lower
+    // bands also pass the allpasses of the higher crossovers, so all bands are in phase
+    // and add up to a flat response.
+    class Splitter
+    {
+    public:
+        void prepare (double sampleRate, bool shouldCompensate)
+        {
+            compensate = shouldCompensate;
+            const juce::dsp::ProcessSpec spec { sampleRate, 1, 2 };
+            for (int i = 0; i < numBands - 1; ++i)
+            {
+                split[(size_t) i].setCutoffFrequency (crossovers[i]);
+                split[(size_t) i].prepare (spec);
+            }
+
+            // Band b gets the allpasses of crossovers b+1 ... (band 0: 3, band 1: 2, band 2: 1)
+            size_t n = 0;
+            for (int b = 0; b < numBands - 2; ++b)
+                for (int c = b + 1; c < numBands - 1; ++c, ++n)
+                {
+                    allpass[n].setType (juce::dsp::LinkwitzRileyFilterType::allpass);
+                    allpass[n].setCutoffFrequency (crossovers[c]);
+                    allpass[n].prepare (spec);
+                }
+        }
+
+        void reset()
+        {
+            for (auto& f : split)   f.reset();
+            for (auto& f : allpass) f.reset();
+        }
+
+        void process (float l, float r, Values& bandL, Values& bandR) noexcept
+        {
+            float restL = l, restR = r;
+            for (size_t c = 0; c < (size_t) numBands - 1; ++c)
+            {
+                float highL, highR;
+                split[c].processSample (0, restL, bandL[c], highL);
+                split[c].processSample (1, restR, bandR[c], highR);
+                restL = highL;
+                restR = highR;
+            }
+            bandL[(size_t) numBands - 1] = restL;
+            bandR[(size_t) numBands - 1] = restR;
+
+            if (compensate)
+            {
+                size_t n = 0;
+                for (size_t b = 0; b < (size_t) numBands - 2; ++b)
+                    for (size_t c = b + 1; c < (size_t) numBands - 1; ++c, ++n)
+                    {
+                        bandL[b] = allpass[n].processSample (0, bandL[b]);
+                        bandR[b] = allpass[n].processSample (1, bandR[b]);
+                    }
+            }
+        }
+
+    private:
+        std::array<juce::dsp::LinkwitzRileyFilter<float>, numBands - 1> split;
+        std::array<juce::dsp::LinkwitzRileyFilter<float>, 6> allpass;
+        bool compensate = false;
+    };
+
+    //==========================================================================
+    // Level per band (power of both channels, attack/release)
+    class Detector
+    {
+    public:
+        void prepare (double sampleRate)
+        {
+            const auto coefficient = [sampleRate] (float ms) { return 1.0f - std::exp (-1.0f / (float) (sampleRate * ms * 0.001)); };
+            attack = coefficient (attackMs);
+            for (size_t b = 0; b < (size_t) numBands; ++b)
+                release[b] = coefficient (releaseMs[b]);
+            reset();
+        }
+
+        void reset()   { power.fill (0.0f); }
+
+        void process (const Values& l, const Values& r) noexcept
+        {
+            for (size_t b = 0; b < (size_t) numBands; ++b)
+            {
+                const float p = 0.5f * (l[b] * l[b] + r[b] * r[b]);
+                power[b] += (p > power[b] ? attack : release[b]) * (p - power[b]);
+            }
+        }
+
+        float levelDb (size_t band) const noexcept   { return 10.0f * std::log10 (power[band] + 1.0e-12f); }
+
+    private:
+        float attack = 0.0f;
+        Values release {}, power {};
+    };
+
+    //==========================================================================
+    // Level distribution of a signal (reference, learned or live input, output)
+    class Analyser
+    {
+    public:
+        void prepare (double sampleRate)
+        {
+            splitter.prepare (sampleRate, false);
+            detector.prepare (sampleRate);
+            interval = juce::jmax (1, juce::roundToInt (sampleRate / readingsPerSecond));
+            reset();
+        }
+
+        void reset()
+        {
+            splitter.reset();
+            detector.reset();
+            for (auto& h : histogram)
+                h.fill (0.0);
+            weight = 0.0;
+            counter = 0;
+        }
+
+        // decay per reading: 1 = all readings count equally, < 1 = the newest count more
+        void process (const float* l, const float* r, int numSamples, double decay = 1.0) noexcept
+        {
+            Values bl, br;
+            for (int i = 0; i < numSamples; ++i)
+            {
+                splitter.process (l[i], r[i], bl, br);
+                detector.process (bl, br);
+                if (++counter >= interval)
+                {
+                    counter = 0;
+                    addReading (decay);
+                }
+            }
+        }
+
+        // At least this many seconds of signal so far
+        bool hasData (double seconds = 1.0) const noexcept   { return weight >= seconds * readingsPerSecond * 0.5; }
+
+        Profile getProfile() const
+        {
+            Profile p;
+            for (size_t b = 0; b < (size_t) numBands; ++b)
+                for (size_t i = 0; i < (size_t) histogramSize; ++i)
+                    p.histogram[b][i] = (float) histogram[b][i];
+            p.evaluate();
+            return p;
+        }
+
+    private:
+        void addReading (double decay) noexcept
+        {
+            Values levels;
+            float loudest = -200.0f;
+            for (size_t b = 0; b < (size_t) numBands; ++b)
+                loudest = juce::jmax (loudest, levels[b] = detector.levelDb (b));
+
+            if (loudest < -90.0f)   // silence (pause, stopped transport) is not counted
+                return;
+
+            for (size_t b = 0; b < (size_t) numBands; ++b)
+            {
+                auto& h = histogram[b];
+                if (decay < 1.0)
+                    for (auto& v : h)
+                        v *= decay;
+
+                const int bin = (int) ((levels[b] - histogramMin) / histogramStep);
+                if (bin >= 0 && bin < histogramSize)
+                    h[(size_t) bin] += 1.0;
+            }
+            weight = weight * decay + 1.0;
+        }
+
+        Splitter splitter;
+        Detector detector;
+        std::array<std::array<double, histogramSize>, numBands> histogram {};
+        double weight = 0.0;
+        int interval = 480, counter = 0;
+    };
+
+    //==========================================================================
+    // The multiband dynamics stage in the audio path. The detector gets the input
+    // before the lookahead delay, the bands are taken from the delayed signal, so
+    // the gain is in place when a transient arrives.
+    //
+    // Gain per band (dB) = (slope - 1) * (level - pivot), slope = target range / input
+    // range: < 1 compresses, > 1 expands. Limited to +-12 dB; more than 24 dB below the
+    // pivot it fades out (quiet passages and noise are neither raised nor pushed down).
+    class Matcher
+    {
+    public:
+        void prepare (double sampleRate)
+        {
+            splitter.prepare (sampleRate, true);
+            detectorSplitter.prepare (sampleRate, false);
+            detector.prepare (sampleRate);
+            smoothing = 1.0f - std::exp (-1.0f / (float) (sampleRate * 0.05));   // targets glide over 50 ms
+            fadeStep  = 1.0f / (float) (sampleRate * 0.02);                     // in / out of the path: 20 ms
+            reset();
+        }
+
+        void reset()
+        {
+            splitter.reset();
+            detectorSplitter.reset();
+            detector.reset();
+            slope.fill (1.0f);
+            pivot.fill (-30.0f);
+            gain.fill (1.0f);
+            gainStep.fill (0.0f);
+            fade = 0.0f;
+            counter = 0;
+            for (size_t b = 0; b < (size_t) numBands; ++b)
+            {
+                targetSlope[b].store (1.0f, std::memory_order_relaxed);
+                targetPivot[b].store (-30.0f, std::memory_order_relaxed);
+                gainsDb[b].store (0.0f, std::memory_order_relaxed);
+            }
+        }
+
+        // Engine thread: new targets (slope 1 everywhere = stage off)
+        void setTargets (const Values& newSlope, const Values& newPivot) noexcept
+        {
+            for (size_t b = 0; b < (size_t) numBands; ++b)
+            {
+                targetSlope[b].store (newSlope[b], std::memory_order_relaxed);
+                targetPivot[b].store (newPivot[b], std::memory_order_relaxed);
+            }
+        }
+
+        // Audio thread: the input sample (lookahead) and the delayed sample to process
+        void process (float inL, float inR, float& l, float& r) noexcept
+        {
+            Values bl, br;
+            detectorSplitter.process (inL, inR, bl, br);
+            detector.process (bl, br);
+
+            if (--counter <= 0)
+                updateGains();
+
+            splitter.process (l, r, bl, br);
+            float wetL = 0.0f, wetR = 0.0f;
+            for (size_t b = 0; b < (size_t) numBands; ++b)
+            {
+                gain[b] += gainStep[b];
+                wetL += gain[b] * bl[b];
+                wetR += gain[b] * br[b];
+            }
+
+            // Not needed (all slopes 1): the dry signal, without the crossover phase shift
+            fade = juce::jlimit (0.0f, 1.0f, fade + (needed ? fadeStep : -fadeStep));
+            l += fade * (wetL - l);
+            r += fade * (wetR - r);
+        }
+
+        float getGainDb (size_t band) const noexcept   { return gainsDb[band].load (std::memory_order_relaxed); }
+
+    private:
+        static constexpr int gainInterval = 8;   // gains are calculated every 8 samples and ramped
+
+        void updateGains() noexcept
+        {
+            counter = gainInterval;
+            needed = false;
+            for (size_t b = 0; b < (size_t) numBands; ++b)
+            {
+                const float targetS = targetSlope[b].load (std::memory_order_relaxed);
+                const float glide = 1.0f - std::pow (1.0f - smoothing, (float) gainInterval);
+                slope[b] += glide * (targetS - slope[b]);
+                pivot[b] += glide * (targetPivot[b].load (std::memory_order_relaxed) - pivot[b]);
+                needed = needed || std::abs (targetS - 1.0f) > 1.0e-3f || std::abs (slope[b] - 1.0f) > 1.0e-3f;
+
+                const float d = detector.levelDb (b) - pivot[b];
+                const float weight = juce::jlimit (0.0f, 1.0f, (d + 36.0f) / 12.0f);   // fade out below -24 dB
+                const float db = juce::jlimit (-12.0f, 12.0f, (slope[b] - 1.0f) * juce::jlimit (-24.0f, 24.0f, d) * weight);
+
+                gainStep[b] = (juce::Decibels::decibelsToGain (db) - gain[b]) / (float) gainInterval;
+                gainsDb[b].store (db, std::memory_order_relaxed);
+            }
+        }
+
+        Splitter splitter, detectorSplitter;
+        Detector detector;
+        Values slope {}, pivot {}, gain {}, gainStep {};
+        std::array<std::atomic<float>, numBands> targetSlope, targetPivot, gainsDb;
+        float smoothing = 0.0f, fade = 0.0f, fadeStep = 0.0f;
+        bool needed = false;
+        int counter = 0;
+    };
+}

@@ -8,6 +8,8 @@ namespace ParamIDs
 {
     inline constexpr const char* amount   = "amount";     // match amount 0 ... 100 %
     inline constexpr const char* response = "response";   // time constant of the live analysis (s)
+    inline constexpr const char* dynamics = "dynamics";   // dynamics match amount 0 ... 100 %
+    inline constexpr const char* bypass   = "bypass";
 }
 
 //==============================================================================
@@ -17,7 +19,9 @@ namespace ParamIDs
 // between the channels per band). The input of the plugin can be learned in the same
 // way (LEARN); MATCH then moves the signal towards the reference with a static
 // correction (learned input -> reference) followed by a dynamic one that follows
-// the music. See MatchEngine.
+// the music. The dynamics of the reference in five bands are matched by a multiband
+// compressor / expander with its own amount (DYNAMICS). See MatchEngine and Dynamics.
+// Bypass: cross-fade to the input, delayed by the latency.
 //==============================================================================
 class UlMaToProcessor final : public juce::AudioProcessor
 {
@@ -47,6 +51,8 @@ public:
     const juce::String getProgramName (int) override       { return {}; }
     void changeProgramName (int, const juce::String&) override {}
 
+    juce::AudioProcessorParameter* getBypassParameter() const override   { return bypassParam; }
+
     void getStateInformation (juce::MemoryBlock& destData) override;
     void setStateInformation (const void* data, int sizeInBytes) override;
 
@@ -66,30 +72,44 @@ public:
     // Result of the last analysis (any thread except audio); the version increases
     // with every new result, so the display knows when to update
     Spectrum::Profile getReferenceProfile() const;
+    Dynamics::Profile getReferenceDynamics() const;
     int getReferenceVersion() const noexcept               { return referenceVersion.load(); }
 
     // LEARN: analyse the input of the plugin while switched on
     void setLearning (bool shouldLearn)                    { engine.setLearning (shouldLearn); }
     bool isLearning() const noexcept                       { return engine.isLearning(); }
     Spectrum::Profile getLearnedProfile() const            { return engine.getLearned(); }
+    Dynamics::Profile getLearnedDynamics() const           { return engine.getLearnedDynamics(); }
     int getLearnedVersion() const noexcept                 { return engine.getLearnedVersion(); }
 
     // Spectrum of the processed signal (for the display)
     Spectrum::Profile getOutputProfile() const             { return engine.getOutputProfile(); }
 
+    // Dynamics: live input / output distributions, slopes and current gain per band
+    MatchEngine::DynamicsState getDynamicsState() const    { return engine.getDynamicsState(); }
+    float getDynamicsGainDb (int band) const noexcept      { return engine.getDynamicsGainDb (band); }
+
     juce::AudioProcessorValueTreeState apvts;
 
 private:
     static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
-    void setReferenceProfile (const Spectrum::Profile& profile);
+    void setReferenceProfile (const Spectrum::Profile& profile, const Dynamics::Profile& dynamics);
 
     juce::AudioFormatManager formatManager;
     MatchEngine engine;
     std::atomic<float>* amountParam = nullptr;
     std::atomic<float>* responseParam = nullptr;
+    std::atomic<float>* dynamicsParam = nullptr;
+    juce::AudioParameterBool* bypassParam = nullptr;
+
+    // Bypass: the input delayed by the latency, cross-fade over 20 ms
+    juce::AudioBuffer<float> dryDelay, dryBlock;
+    int dryPosition = 0;
+    juce::SmoothedValue<float> bypassMix;
 
     mutable juce::CriticalSection referenceLock;
     Spectrum::Profile referenceProfile;
+    Dynamics::Profile referenceDynamics;
     std::atomic<int> referenceVersion { 0 };
 
     juce::ThreadPool analysisPool { juce::ThreadPoolOptions{}.withThreadName ("UlMaTo analysis").withNumberOfThreads (1) };

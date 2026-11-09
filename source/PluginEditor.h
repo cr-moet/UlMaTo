@@ -3,8 +3,10 @@
 #include "Views.h"
 
 //==============================================================================
-// Layout from top to bottom: reference song (waveform + ANALYZE), the three
-// analysis displays, the live spectrum with the MATCH knob next to it
+// Layout from top to bottom: header with BYPASS, reference song (waveform + ANALYZE,
+// LEARN), tabs, then one of two pages:
+//  EQ MATCH       - the three analysis displays, the output spectrum, MATCH / RESPONSE
+//  DYNAMICS MATCH - level distributions per band, DYNAMICS knob
 //==============================================================================
 class UlMaToEditor final : public juce::AudioProcessorEditor,
                            private juce::Timer
@@ -18,9 +20,15 @@ public:
 
 private:
     void timerCallback() override;
+    void showPage (int page);
 
     UlMaToProcessor& processor;
     UlMaToLookAndFeel lookAndFeel;
+
+    juce::TextButton bypassButton { "BYPASS" };
+    juce::AudioProcessorValueTreeState::ButtonAttachment bypassAttachment { processor.apvts, ParamIDs::bypass, bypassButton };
+
+    juce::TextButton eqTab { "EQ MATCH" }, dynamicsTab { "DYNAMICS MATCH" };
 
     WaveformView waveform { processor };
     juce::TextButton analyseButton { "ANALYZE" };
@@ -42,6 +50,13 @@ private:
     juce::AudioProcessorValueTreeState::SliderAttachment matchAttachment    { processor.apvts, ParamIDs::amount,   matchKnob },
                                                          responseAttachment { processor.apvts, ParamIDs::response, responseKnob };
 
+    // Dynamics page
+    DynamicsView dynamicsView { processor };
+    juce::Slider dynamicsKnob { juce::Slider::RotaryHorizontalVerticalDrag, juce::Slider::TextBoxBelow };
+    juce::Label dynamicsLabel, dynamicsInfo;
+    juce::AudioProcessorValueTreeState::SliderAttachment dynamicsAttachment { processor.apvts, ParamIDs::dynamics, dynamicsKnob };
+
+    juce::Rectangle<int> tabLine;
     int shownReferenceVersion = -1, shownLearnedVersion = -1;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (UlMaToEditor)
