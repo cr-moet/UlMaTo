@@ -627,56 +627,62 @@ private:
 };
 
 //==============================================================================
-// Tabs of the two stages in processing order (left = first, arrow = signal flow).
-// A click selects the page, dragging a tab past the other one swaps the order.
+// Tabs of the stages in processing order (left = first, arrows = signal flow).
+// A click selects the page, dragging a tab moves the stage to where it is dropped.
 //==============================================================================
 class StageTabs final : public juce::Component
 {
 public:
+    using Order = MatchEngine::Order;
+
     StageTabs()   { setMouseCursor (juce::MouseCursor::PointingHandCursor); }
 
-    std::function<void (int)>  onSelect;        // 0 = EQ, 1 = dynamics
-    std::function<void (bool)> onOrderChange;   // true = dynamics first
+    std::function<void (int)>          onSelect;        // page = stage
+    std::function<void (const Order&)> onOrderChange;
 
-    void setState (int page, bool newDynamicsFirst)
+    void setState (int page, const Order& newOrder)
     {
-        if (page != selected || newDynamicsFirst != dynamicsFirst)
+        if (page != selected || newOrder != order)
         {
             selected = page;
-            dynamicsFirst = newDynamicsFirst;
+            order = newOrder;
             repaint();
         }
     }
 
     void paint (juce::Graphics& g) override
     {
-        for (int slot = 0; slot < 2; ++slot)
-            if (pageAt (slot) != dragged)
-                drawTab (g, pageAt (slot), slotBounds (slot));
+        for (int slot = 0; slot < numSlots; ++slot)
+        {
+            if (order[(size_t) slot] != dragged)
+                drawTab (g, order[(size_t) slot], slotBounds (slot));
 
-        // Arrow between the tabs: signal flow
-        const auto a = slotBounds (0).getRight() + arrowGap * 0.5f, y = (float) getHeight() * 0.5f;
-        juce::Path arrow;
-        arrow.addTriangle (a - 5.0f, y - 6.0f, a - 5.0f, y + 6.0f, a + 6.0f, y);
-        g.setColour (Colours::text);
-        g.fillPath (arrow);
+            if (slot < numSlots - 1)   // arrow to the next stage
+            {
+                const auto a = slotBounds (slot).getRight() + arrowGap * 0.5f, y = (float) getHeight() * 0.5f;
+                juce::Path arrow;
+                arrow.addTriangle (a - 5.0f, y - 6.0f, a - 5.0f, y + 6.0f, a + 6.0f, y);
+                g.setColour (Colours::text);
+                g.fillPath (arrow);
+            }
+        }
 
         g.setColour (Colours::text.withAlpha (0.55f));
         g.setFont (juce::Font (juce::FontOptions (11.0f)));
         g.drawText ("SIGNAL FLOW  -  drag a tab to change the order",
-                    getLocalBounds().toFloat().withTrimmedLeft (slotBounds (1).getRight() + 16.0f), juce::Justification::centredLeft);
+                    getLocalBounds().toFloat().withTrimmedLeft (slotBounds (numSlots - 1).getRight() + 16.0f), juce::Justification::centredLeft);
 
         if (dragged >= 0)   // the dragged tab on top, where the mouse is
-            drawTab (g, dragged, slotBounds (0).withX (juce::jlimit (0.0f, slotBounds (1).getX(), dragX)));
+            drawTab (g, dragged, slotBounds (0).withX (juce::jlimit (0.0f, slotBounds (numSlots - 1).getX(), dragX)));
     }
 
     void mouseDown (const juce::MouseEvent& e) override
     {
         pressed = -1;
-        for (int slot = 0; slot < 2; ++slot)
+        for (int slot = 0; slot < numSlots; ++slot)
             if (slotBounds (slot).contains (e.position))
             {
-                pressed = pageAt (slot);
+                pressed = order[(size_t) slot];
                 grabOffset = e.position.x - slotBounds (slot).getX();
             }
     }
@@ -695,13 +701,23 @@ public:
     {
         if (dragged >= 0)
         {
-            // Swap when the centre of the dragged tab has passed the middle between the slots
-            const float middle = (slotBounds (0).getCentreX() + slotBounds (1).getCentreX()) * 0.5f;
-            const float centre = dragX + slotBounds (0).getWidth() * 0.5f;
-            const bool wantFirst = centre < middle;
-            const bool isFirst = pageAt (0) == dragged;
-            if (wantFirst != isFirst && onOrderChange != nullptr)
-                onOrderChange (! dynamicsFirst);
+            // The slot nearest to where the tab was dropped
+            const int target = juce::jlimit (0, numSlots - 1, juce::roundToInt (dragX / (tabWidth + arrowGap)));
+            Order newOrder;
+            int n = 0;
+            for (int slot = 0; slot < numSlots; ++slot)   // the others keep their order around it
+            {
+                if (slot == target)
+                    newOrder[(size_t) slot] = dragged;
+                else
+                {
+                    while (order[(size_t) n] == dragged)
+                        ++n;
+                    newOrder[(size_t) slot] = order[(size_t) n++];
+                }
+            }
+            if (newOrder != order && onOrderChange != nullptr)
+                onOrderChange (newOrder);
             dragged = -1;
             setMouseCursor (juce::MouseCursor::PointingHandCursor);
             repaint();
@@ -712,9 +728,8 @@ public:
     }
 
 private:
+    static constexpr int numSlots = MatchEngine::numStages;
     static constexpr float tabWidth = 170.0f, arrowGap = 28.0f;
-
-    int pageAt (int slot) const   { return (slot == 0) == dynamicsFirst ? 1 : 0; }
 
     juce::Rectangle<float> slotBounds (int slot) const
     {
@@ -738,14 +753,14 @@ private:
         for (int i = 0; i < 3; ++i)
             g.fillRect (r.getX() + 10.0f + (float) i * 3.0f, r.getCentreY() - 7.0f, 1.2f, 12.0f);
 
+        static constexpr const char* names[] { "EQ MATCH", "DYNAMICS MATCH", "ANALOG HEAT" };
         g.setColour (fg);
         g.setFont (juce::Font (juce::FontOptions (13.0f, juce::Font::bold)));
-        g.drawText (page == 0 ? "EQ MATCH" : "DYNAMICS MATCH", r.withTrimmedLeft (18.0f).withTrimmedBottom (3.0f),
-                    juce::Justification::centred);
+        g.drawText (names[page], r.withTrimmedLeft (18.0f).withTrimmedBottom (3.0f), juce::Justification::centred);
     }
 
+    Order order { 0, 1, 2 };
     int selected = 0, pressed = -1, dragged = -1;
-    bool dynamicsFirst = false;
     float dragX = 0.0f, grabOffset = 0.0f;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (StageTabs)

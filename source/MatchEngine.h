@@ -3,6 +3,7 @@
 #include "Spectrum.h"
 #include "MatrixConvolver.h"
 #include "Dynamics.h"
+#include "Analog.h"
 #include <complex>
 
 //==============================================================================
@@ -15,11 +16,14 @@
 //                Bands that drop out or return are held until the analysis has caught
 //                up, boosts change slowly and cuts quickly, so returning bass does not
 //                pump or overshoot.
-// Both are combined into one 2x2 filter matrix (one convolution stage). Before or after
-// it (setDynamicsFirst) sits the multiband dynamics stage (Dynamics::Matcher), which
-// maps the dynamic range of its input (learned or live) per band to the one of the
-// reference. The 10 ms lookahead delay always sits in front of the dynamics stage, so
-// both orders have the same latency. The audio runs 10 ms behind the analysis.
+// Both are combined into one 2x2 filter matrix (one convolution stage).
+//
+// Three stages in any order (setStageOrder), each working on blocks of 512 samples:
+//  EQ       - the filter matrix,
+//  DYNAMICS - multiband dynamics (Dynamics::Matcher) with its own 10 ms lookahead delay:
+//             maps the dynamic range of its input per band to the one of the reference,
+//  ANALOG   - analog heat (Analog::Heat): tape, wow/flutter, crackle, tube, transformer.
+// The latency is the same in every order.
 //
 // Audio thread  - process(): hands input/output to the engine thread, applies the filters.
 // Engine thread - analysis, learning, correction and filter design (about every 40 ms);
@@ -39,13 +43,14 @@ public:
     void prepare (double sampleRate, int maxBlockSize);
     void release();
 
-    // Lookahead + internal block + linear-phase filters (half their length)
-    int getLatencySamples() const noexcept   { return lookahead + blockSize + firLength / 2; }
+    // Internal block + linear-phase filters (half their length) + lookahead + analog stage
+    int getLatencySamples() const noexcept   { return blockSize + firLength / 2 + lookahead + analog.getLatencySamples(); }
 
     // Audio thread. amount = 0 ... 1 (0 = no correction, signal only delayed),
     // response = time constant of the live analysis in seconds,
-    // dynamicsAmount = 0 ... 1 (0 = dynamics stage off)
-    void process (juce::AudioBuffer<float>& buffer, float amount, float response, float dynamicsAmount) noexcept;
+    // dynamicsAmount = 0 ... 1 (0 = dynamics stage off), analog: settings of the analog stage
+    void process (juce::AudioBuffer<float>& buffer, float amount, float response, float dynamicsAmount,
+                  const Analog::Settings& analog) noexcept;
 
     // Profiles (any thread except audio)
     void setReference (const Spectrum::Profile& reference);
@@ -53,8 +58,11 @@ public:
     Spectrum::Profile getLearned() const;
     Spectrum::Profile getOutputProfile() const;   // processed signal, for the display
 
-    // Order of the stages; a change mutes the output for about 0.1 s (the paths differ)
-    void setDynamicsFirst (bool first) noexcept      { dynamicsFirstRequest = first; }
+    // Order of the stages (0 = EQ, 1 = dynamics, 2 = analog); a change mutes the output for
+    // about 0.15 s (the paths differ)
+    enum Stage { eqStage, dynamicsStage, analogStage, numStages };
+    using Order = std::array<int, numStages>;
+    void setStageOrder (const Order& order) noexcept   { orderRequest = encode (order); }
 
     // Dynamics (any thread except audio)
     void setReferenceDynamics (const Dynamics::Profile& reference);
@@ -108,6 +116,9 @@ private:
                         const Spectrum::Curve& fastMid, const Spectrum::Curve& fastSide, double seconds);
     void designFilters (const Correction& c, MatrixConvolver::Filters& filters);
     void updateDynamicsMatch();
+    void processBlock() noexcept;
+    static int encode (const Order& o) noexcept   { return o[0] + 3 * o[1] + 9 * o[2]; }
+    static Order decode (int code) noexcept       { return { code % 3, (code / 3) % 3, code / 9 }; }
 
     double sampleRate = 48000.0;
     int firLength = 4096, lookahead = 480;
@@ -144,11 +155,13 @@ private:
     Dynamics::Analyser stageDynamics;   // engine thread: readings of the dynamics stage
     Dynamics::Values pivot {};          // engine thread: gliding centre per band
     std::array<bool, Dynamics::numBands> pivotValid {};
-    double lastPivotUpdate = 0.0;
+
+    Analog::Heat analog;
+    Analog::Settings analogSettings;    // audio thread
 
     // Order of the stages and the mute while it changes
-    std::atomic<bool> dynamicsFirstRequest { false };
-    bool dynamicsFirst = false;
+    std::atomic<int> orderRequest { encode ({ eqStage, dynamicsStage, analogStage }) };
+    int orderCode = 0;
     float switchGain = 1.0f, switchStep = 0.0f;
     int switchMute = 0;
     juce::AudioBuffer<float> delayLine;

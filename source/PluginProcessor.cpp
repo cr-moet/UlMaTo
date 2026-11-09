@@ -6,7 +6,8 @@ namespace
     const juce::Identifier fileProperty ("referenceFile"), startProperty ("rangeStart"),
                            endProperty ("rangeEnd"), profileProperty ("referenceProfile"),
                            learnedProperty ("learnedProfile"), referenceDynamicsProperty ("referenceDynamics"),
-                           learnedDynamicsProperty ("learnedDynamics"), dynamicsFirstProperty ("dynamicsFirst");
+                           learnedDynamicsProperty ("learnedDynamics"), orderProperty ("stageOrder"),
+                           dynamicsFirstProperty ("dynamicsFirst");   // older versions
 
     constexpr int dryBlockSize = 1024;   // bypass is handled in chunks of this size
 
@@ -70,6 +71,13 @@ UlMaToProcessor::UlMaToProcessor()
     responseParam = apvts.getRawParameterValue (ParamIDs::response);
     dynamicsParam = apvts.getRawParameterValue (ParamIDs::dynamics);
     bypassParam   = dynamic_cast<juce::AudioParameterBool*> (apvts.getParameter (ParamIDs::bypass));
+    for (size_t b = 0; b < tapeParams.size(); ++b)
+        tapeParams[b] = apvts.getRawParameterValue (ParamIDs::tape[b]);
+    wowParam         = apvts.getRawParameterValue (ParamIDs::wow);
+    flutterParam     = apvts.getRawParameterValue (ParamIDs::flutter);
+    crackleParam     = apvts.getRawParameterValue (ParamIDs::crackle);
+    tubeParam        = apvts.getRawParameterValue (ParamIDs::tube);
+    transformerParam = apvts.getRawParameterValue (ParamIDs::transformer);
 }
 
 UlMaToProcessor::~UlMaToProcessor()
@@ -87,17 +95,31 @@ juce::AudioProcessorValueTreeState::ParameterLayout UlMaToProcessor::createParam
     const auto percent = juce::AudioParameterFloatAttributes().withLabel ("%")
                              .withStringFromValueFunction ([] (float v, int) { return juce::String (v, 0) + " %"; });
 
-    return { std::make_unique<juce::AudioParameterFloat> (
+    juce::AudioProcessorValueTreeState::ParameterLayout layout;
+    const auto addPercent = [&] (const char* id, const juce::String& name, float defaultValue)
+    {
+        layout.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { id, 1 }, name,
+                                                                 juce::NormalisableRange<float> (0.0f, 100.0f, 0.1f), defaultValue, percent));
+    };
+
+    layout.add (std::make_unique<juce::AudioParameterFloat> (
                  juce::ParameterID { ParamIDs::amount, 1 }, "Match",
                  juce::NormalisableRange<float> (0.0f, 100.0f, 0.1f), 50.0f, percent),
              std::make_unique<juce::AudioParameterFloat> (
                  juce::ParameterID { ParamIDs::response, 1 }, "Response", responseRange, 1.0f,
                  juce::AudioParameterFloatAttributes().withLabel ("s")
                      .withStringFromValueFunction ([] (float v, int) { return juce::String (v, v < 1.0f ? 2 : 1) + " s"; })),
-             std::make_unique<juce::AudioParameterFloat> (
-                 juce::ParameterID { ParamIDs::dynamics, 1 }, "Dynamics Match",
-                 juce::NormalisableRange<float> (0.0f, 100.0f, 0.1f), 50.0f, percent),
-             std::make_unique<juce::AudioParameterBool> (juce::ParameterID { ParamIDs::bypass, 1 }, "Bypass", false) };
+             std::make_unique<juce::AudioParameterBool> (juce::ParameterID { ParamIDs::bypass, 1 }, "Bypass", false));
+
+    addPercent (ParamIDs::dynamics, "Dynamics Match", 50.0f);
+    for (int b = 0; b < Dynamics::numBands; ++b)
+        addPercent (ParamIDs::tape[b], juce::String ("Tape ") + Dynamics::bandNames[b], 0.0f);
+    addPercent (ParamIDs::wow,         "Wow",         0.0f);
+    addPercent (ParamIDs::flutter,     "Flutter",     0.0f);
+    addPercent (ParamIDs::crackle,     "Vinyl Crackle", 0.0f);
+    addPercent (ParamIDs::tube,        "Tube",        0.0f);
+    addPercent (ParamIDs::transformer, "Transformer", 0.0f);
+    return layout;
 }
 
 bool UlMaToProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
@@ -132,6 +154,15 @@ void UlMaToProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Midi
     const int numChannels = juce::jmin (2, buffer.getNumChannels());
     bypassMix.setTargetValue (bypassParam->get() ? 1.0f : 0.0f);
 
+    Analog::Settings analog;
+    for (size_t b = 0; b < tapeParams.size(); ++b)
+        analog.tape[b] = tapeParams[b]->load() * 0.01f;
+    analog.wow         = wowParam->load() * 0.01f;
+    analog.flutter     = flutterParam->load() * 0.01f;
+    analog.crackle     = crackleParam->load() * 0.01f;
+    analog.tube        = tubeParam->load() * 0.01f;
+    analog.transformer = transformerParam->load() * 0.01f;
+
     // In chunks: keep the delayed input, process, mix (the engine keeps running when
     // bypassed, so switching back is seamless)
     for (int start = 0; start < buffer.getNumSamples(); start += dryBlockSize)
@@ -151,7 +182,7 @@ void UlMaToProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Midi
         }
 
         juce::AudioBuffer<float> chunk (buffer.getArrayOfWritePointers(), buffer.getNumChannels(), start, count);
-        engine.process (chunk, amountParam->load() * 0.01f, responseParam->load(), dynamicsParam->load() * 0.01f);
+        engine.process (chunk, amountParam->load() * 0.01f, responseParam->load(), dynamicsParam->load() * 0.01f, analog);
 
         if (! bypassMix.isSmoothing() && bypassMix.getCurrentValue() == 0.0f)
             continue;
@@ -193,15 +224,22 @@ juce::Range<double> UlMaToProcessor::getReferenceRange() const
              (double) apvts.state.getProperty (endProperty, 0.0) };
 }
 
-void UlMaToProcessor::setDynamicsFirst (bool first)
+void UlMaToProcessor::setStageOrder (const MatchEngine::Order& order)
 {
-    apvts.state.setProperty (dynamicsFirstProperty, first, nullptr);
-    engine.setDynamicsFirst (first);
+    apvts.state.setProperty (orderProperty, juce::String (order[0]) + juce::String (order[1]) + juce::String (order[2]), nullptr);
+    engine.setStageOrder (order);
 }
 
-bool UlMaToProcessor::isDynamicsFirst() const
+// Stored as e.g. "012" (EQ, dynamics, analog); older versions only knew "dynamics first"
+MatchEngine::Order UlMaToProcessor::getStageOrder() const
 {
-    return (bool) apvts.state.getProperty (dynamicsFirstProperty, false);
+    const auto text = apvts.state.getProperty (orderProperty).toString();
+    if (text.length() == 3 && text.containsOnly ("012") && text.containsChar ('0') && text.containsChar ('1') && text.containsChar ('2'))
+        return { (int) (text[0] - '0'), (int) (text[1] - '0'), (int) (text[2] - '0') };
+
+    if ((bool) apvts.state.getProperty (dynamicsFirstProperty, false))
+        return { MatchEngine::dynamicsStage, MatchEngine::eqStage, MatchEngine::analogStage };
+    return { MatchEngine::eqStage, MatchEngine::dynamicsStage, MatchEngine::analogStage };
 }
 
 Spectrum::Profile UlMaToProcessor::getReferenceProfile() const
@@ -313,7 +351,7 @@ void UlMaToProcessor::setStateInformation (const void* data, int sizeInBytes)
             for (const auto& id : { profileProperty, learnedProperty, referenceDynamicsProperty, learnedDynamicsProperty })
                 state.removeProperty (id, nullptr);
             apvts.replaceState (state);
-            engine.setDynamicsFirst (isDynamicsFirst());
+            engine.setStageOrder (getStageOrder());
 
             if (profile.valid)
                 setReferenceProfile (profile, dynamics);   // saved by an older version: no dynamics until analysed again

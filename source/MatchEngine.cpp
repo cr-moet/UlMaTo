@@ -255,7 +255,8 @@ void MatchEngine::prepare (double newSampleRate, int)
     output.dynamics.prepare (sampleRate);
     output.withDynamics = true;
     learnDynamics.prepare (sampleRate);
-    dynamicsFirst = dynamicsFirstRequest.load();
+    analog.prepare (sampleRate, blockSize);
+    orderCode = orderRequest.load();
     switchGain = 1.0f;
     switchStep = 1.0f / (float) (sampleRate * 0.01);
     switchMute = 0;
@@ -350,7 +351,8 @@ Spectrum::Profile MatchEngine::getOutputProfile() const
 }
 
 //==============================================================================
-void MatchEngine::process (juce::AudioBuffer<float>& buffer, float amount, float response, float dynamicsAmount) noexcept
+void MatchEngine::process (juce::AudioBuffer<float>& buffer, float amount, float response, float dynamicsAmount,
+                           const Analog::Settings& analogNow) noexcept
 {
     const int numSamples = buffer.getNumSamples();
     if (! prepared || numSamples == 0 || buffer.getNumChannels() == 0)
@@ -359,57 +361,35 @@ void MatchEngine::process (juce::AudioBuffer<float>& buffer, float amount, float
     currentAmount.store (amount, std::memory_order_relaxed);
     currentResponse.store (response, std::memory_order_relaxed);
     currentDynamicsAmount.store (dynamicsAmount, std::memory_order_relaxed);
+    analogSettings = analogNow;
 
     float* left  = buffer.getWritePointer (0);
     float* right = buffer.getNumChannels() > 1 ? buffer.getWritePointer (1) : left;
 
-    // The analysis gets the input now, the audio follows 10 ms later (lookahead)
     input.push (left, right, numSamples);
-
-    float* delayL = delayLine.getWritePointer (0);
-    float* delayR = delayLine.getWritePointer (1);
 
     for (int i = 0; i < numSamples; ++i)
     {
-        // Dynamics first: lookahead delay + dynamics -> filters -> output
-        // Filters first:  filters -> lookahead delay + dynamics -> output
-        // (the detector always gets the signal 10 ms before the gain is applied)
-        const auto d = (size_t) delayPosition, b = (size_t) blockPosition;
-        const float inL = left[i], inR = right[i];
-        float l = delayL[d], r = delayR[d];
-        if (dynamicsFirst)
-        {
-            dynamics.process (inL, inR, l, r);
-            blockL[b] = l;
-            blockR[b] = r;
-            delayL[d] = inL;
-            delayR[d] = inR;
-            l = outL[b];
-            r = outR[b];
-        }
-        else
-        {
-            blockL[b] = inL;
-            blockR[b] = inR;
-            dynamics.process (outL[b], outR[b], l, r);
-            delayL[d] = outL[b];
-            delayR[d] = outR[b];
-        }
-        delayPosition = (delayPosition + 1) % lookahead;
+        // Collect one block, hand out the processed previous one
+        const auto b = (size_t) blockPosition;
+        blockL[b] = left[i];
+        blockR[b] = right[i];
+        float l = outL[b], r = outR[b];
 
-        // Changing the order: fade out, switch, stay silent until the old signal has
-        // left the delay and the filters, fade in
-        if (switchMute > 0 || dynamicsFirstRequest.load (std::memory_order_relaxed) != dynamicsFirst || switchGain < 1.0f)
+        // Changing the order: fade out, switch, stay silent until the old signal has left
+        // all stages, fade in
+        const int requested = orderRequest.load (std::memory_order_relaxed);
+        if (switchMute > 0 || requested != orderCode || switchGain < 1.0f)
         {
             if (switchMute > 0)
                 --switchMute;
-            else if (dynamicsFirstRequest.load (std::memory_order_relaxed) != dynamicsFirst)
+            else if (requested != orderCode)
             {
                 if ((switchGain -= switchStep) <= 0.0f)
                 {
                     switchGain = 0.0f;
-                    dynamicsFirst = ! dynamicsFirst;
-                    switchMute = lookahead + blockSize + firLength;
+                    orderCode = requested;
+                    switchMute = getLatencySamples() + firLength;
                 }
             }
             else
@@ -422,23 +402,10 @@ void MatchEngine::process (juce::AudioBuffer<float>& buffer, float amount, float
         if (right != left)
             right[i] = r;
 
-        if (++blockPosition < blockSize)
-            continue;
-
-        blockPosition = 0;
-
-        // New filters from the engine thread: cross-fade within this block
-        const int active  = activeFilters.load (std::memory_order_relaxed);
-        const bool change = newFilters.load (std::memory_order_acquire);
-        convolver.process (blockL.data(), blockR.data(), filters[(size_t) active],
-                           change ? &filters[(size_t) (1 - active)] : nullptr);
-        std::swap (blockL, outL);
-        std::swap (blockR, outR);
-
-        if (change)
+        if (++blockPosition == blockSize)
         {
-            activeFilters.store (1 - active, std::memory_order_relaxed);
-            newFilters.store (false, std::memory_order_release);
+            blockPosition = 0;
+            processBlock();
         }
     }
 
@@ -446,6 +413,51 @@ void MatchEngine::process (juce::AudioBuffer<float>& buffer, float amount, float
 
     for (int ch = 2; ch < buffer.getNumChannels(); ++ch)
         buffer.clear (ch, 0, numSamples);
+}
+
+// The stages on one block (blockL/R, in place), in the selected order
+void MatchEngine::processBlock() noexcept
+{
+    for (int stage : decode (orderCode))
+    {
+        if (stage == eqStage)
+        {
+            // New filters from the engine thread: cross-fade within this block
+            const int active  = activeFilters.load (std::memory_order_relaxed);
+            const bool change = newFilters.load (std::memory_order_acquire);
+            convolver.process (blockL.data(), blockR.data(), filters[(size_t) active],
+                               change ? &filters[(size_t) (1 - active)] : nullptr);
+            if (change)
+            {
+                activeFilters.store (1 - active, std::memory_order_relaxed);
+                newFilters.store (false, std::memory_order_release);
+            }
+        }
+        else if (stage == dynamicsStage)
+        {
+            // Detector on the signal now, gain on the signal 10 ms later (lookahead)
+            float* delayL = delayLine.getWritePointer (0);
+            float* delayR = delayLine.getWritePointer (1);
+            for (size_t j = 0; j < (size_t) blockSize; ++j)
+            {
+                const auto d = (size_t) delayPosition;
+                float l = delayL[d], r = delayR[d];
+                dynamics.process (blockL[j], blockR[j], l, r);
+                delayL[d] = blockL[j];
+                delayR[d] = blockR[j];
+                blockL[j] = l;
+                blockR[j] = r;
+                delayPosition = (delayPosition + 1) % lookahead;
+            }
+        }
+        else
+        {
+            analog.process (blockL.data(), blockR.data(), blockSize, analogSettings);
+        }
+    }
+
+    std::swap (blockL, outL);
+    std::swap (blockR, outR);
 }
 
 //==============================================================================
@@ -644,16 +656,15 @@ void MatchEngine::updateDynamicsMatch()
     const auto& in = learnedInput.valid ? learnedInput : state.input;
     const float amount = currentDynamicsAmount.load (std::memory_order_relaxed);
 
-    // Pivot: the live centre, gliding (3 s) so that it never jumps; held while a band is
-    // missing right now (more than 15 dB below it), so it is in place when the band returns
-    const auto now = juce::Time::getMillisecondCounterHiRes();
-    const float glide = 1.0f - std::exp (-(float) juce::jlimit (0.0, 1.0, (now - lastPivotUpdate) * 0.001) / 3.0f);
-    lastPivotUpdate = now;
+    // Pivot: the live centre, gliding (3 s of audio, counted in readings) so that it never
+    // jumps; held while a band is missing right now (more than 15 dB below it), so it is in
+    // place when the band returns
+    const float glide = 1.0f - std::exp (-(float) numReadings / (float) (3.0 * Dynamics::readingsPerSecond));
 
     for (size_t b = 0; b < (size_t) Dynamics::numBands; ++b)
     {
         state.slope[b] = 1.0f;
-        const bool missing = pivotValid[b] && (numReadings == 0 || current[b] / (float) numReadings < pivot[b] - 15.0f);
+        const bool missing = pivotValid[b] && numReadings > 0 && current[b] / (float) numReadings < pivot[b] - 15.0f;
         if (state.input.valid && state.input.active[b] && ! missing)
             pivot[b] = pivotValid[b] ? pivot[b] + glide * (state.input.centre[b] - pivot[b]) : state.input.centre[b];
         pivotValid[b] = pivotValid[b] || (state.input.valid && state.input.active[b]);
@@ -661,11 +672,8 @@ void MatchEngine::updateDynamicsMatch()
                 && ref.range[b] > 0.3f && in.upper[b] > 0.3f && in.lower[b] > 0.3f))
             continue;
 
-        // Compression works on both sides of the centre (down above, up below), expansion
-        // only below it: the whole range becomes the reference range
-        const float target = ref.range[b];
-        const float slope = target < in.range[b] ? target / in.range[b]
-                                                 : (target - in.upper[b]) / in.lower[b];
+        // Both work on both sides of the centre: the whole range becomes the reference range
+        const float slope = ref.range[b] / in.range[b];
         state.slope[b] = std::pow (juce::jlimit (minSlope, maxSlope, slope), amount);
     }
     dynamics.setTargets (state.slope, pivot);

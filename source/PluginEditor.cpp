@@ -18,10 +18,10 @@ UlMaToEditor::UlMaToEditor (UlMaToProcessor& p)
 
     // Tabs: click = page, drag = order of the stages
     tabs.onSelect = [this] (int page) { showPage (page); };
-    tabs.onOrderChange = [this] (bool dynamicsFirst)
+    tabs.onOrderChange = [this] (const MatchEngine::Order& order)
     {
-        processor.setDynamicsFirst (dynamicsFirst);
-        tabs.setState (currentPage, dynamicsFirst);
+        processor.setStageOrder (order);
+        tabs.setState (currentPage, order);
     };
     addAndMakeVisible (tabs);
 
@@ -77,6 +77,33 @@ UlMaToEditor::UlMaToEditor (UlMaToProcessor& p)
     dynamicsInfo.setColour (juce::Label::textColourId, Colours::text.withAlpha (0.7f));
     addChildComponent (dynamicsInfo);
 
+    // Analog heat page
+    const auto setUpKnob = [this] (LabelledKnob& k, const char* id, const juce::String& text)
+    {
+        k.knob.setTextBoxStyle (juce::Slider::TextBoxBelow, false, 70, 20);
+        k.knob.setColour (juce::Slider::textBoxBackgroundColourId, Colours::text);
+        k.knob.setColour (juce::Slider::textBoxTextColourId, Colours::accent);
+        k.attachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (processor.apvts, id, k.knob);
+        k.label.setText (text, juce::dontSendNotification);
+        k.label.setFont (juce::Font (juce::FontOptions (12.0f, juce::Font::bold)));
+        k.label.setJustificationType (juce::Justification::centred);
+        addChildComponent (k.knob);
+        addChildComponent (k.label);
+        pages[MatchEngine::analogStage].insert (pages[MatchEngine::analogStage].end(), { &k.knob, &k.label });
+    };
+    for (size_t b = 0; b < tapeKnobs.size(); ++b)
+        setUpKnob (tapeKnobs[b], ParamIDs::tape[b], juce::String (Dynamics::bandNames[b]) + "\n" + Dynamics::bandRanges[b]);
+    setUpKnob (heatKnobs[0], ParamIDs::wow,         "WOW");
+    setUpKnob (heatKnobs[1], ParamIDs::flutter,     "FLUTTER");
+    setUpKnob (heatKnobs[2], ParamIDs::crackle,     "VINYL CRACKLE");
+    setUpKnob (heatKnobs[3], ParamIDs::tube,        "TUBE STAGE");
+    setUpKnob (heatKnobs[4], ParamIDs::transformer, "TRANSFORMER");
+    for (auto& k : tapeKnobs)
+        k.label.setFont (juce::Font (juce::FontOptions (12.0f, juce::Font::bold)));
+
+    pages[MatchEngine::eqStage] = { &stereoView, &midSideView, &phaseView, &liveView, &matchKnob, &responseKnob, &matchLabel, &responseLabel };
+    pages[MatchEngine::dynamicsStage] = { &dynamicsView, &dynamicsKnob, &dynamicsLabel, &dynamicsInfo };
+
     setResizable (true, true);
     setResizeLimits (900, 700, 2400, 1600);
     setSize (1100, 840);
@@ -93,16 +120,14 @@ UlMaToEditor::~UlMaToEditor()
 
 void UlMaToEditor::showPage (int page)
 {
-    const bool dynamics = page == 1;
-    currentPage = page;
-    tabs.setState (page, processor.isDynamicsFirst());
-    processor.apvts.state.setProperty (pageProperty, page, nullptr);
+    currentPage = juce::jlimit (0, (int) pages.size() - 1, page);
+    tabs.setState (currentPage, processor.getStageOrder());
+    processor.apvts.state.setProperty (pageProperty, currentPage, nullptr);
 
-    for (auto* c : std::initializer_list<juce::Component*> { &stereoView, &midSideView, &phaseView, &liveView,
-                                                             &matchKnob, &responseKnob, &matchLabel, &responseLabel })
-        c->setVisible (! dynamics);
-    for (auto* c : std::initializer_list<juce::Component*> { &dynamicsView, &dynamicsKnob, &dynamicsLabel, &dynamicsInfo })
-        c->setVisible (dynamics);
+    for (size_t p = 0; p < pages.size(); ++p)
+        for (auto* c : pages[p])
+            c->setVisible ((int) p == currentPage);
+    repaint();
 }
 
 // Analysis state and new results
@@ -115,7 +140,7 @@ void UlMaToEditor::timerCallback()
         statusLabel.setText ("Analysing ... " + juce::String (juce::roundToInt (processor.getAnalysisProgress() * 100.0f)) + " %",
                              juce::dontSendNotification);
 
-    tabs.setState (currentPage, processor.isDynamicsFirst());   // the order may come from a loaded project
+    tabs.setState (currentPage, processor.getStageOrder());   // the order may come from a loaded project
 
     // LEARN: button text and LED
     const bool learning = learnButton.getToggleState();
@@ -172,6 +197,18 @@ void UlMaToEditor::paint (juce::Graphics& g)
     // Line under the tabs, the page belongs to the selected tab
     g.setColour (Colours::text);
     g.fillRect (tabLine);
+
+    // Analog heat: three groups
+    if (currentPage == MatchEngine::analogStage)
+        for (auto [r, title] : { std::pair { tapePanel, "TAPE SATURATION PER BAND  (stereo: random drive per sample, left and right)" },
+                                 std::pair { transportPanel, "TAPE TRANSPORT / VINYL" },
+                                 std::pair { outputPanel, "OUTPUT STAGES" } })
+        {
+            Plot::drawPanel (g, r.toFloat());
+            g.setColour (Colours::text);
+            g.setFont (juce::Font (juce::FontOptions (12.0f, juce::Font::bold)));
+            g.drawText (title, r.reduced (10, 6).removeFromTop (16), juce::Justification::centredLeft);
+        }
 }
 
 void UlMaToEditor::resized()
@@ -199,6 +236,31 @@ void UlMaToEditor::resized()
     tabs.setBounds (area.removeFromTop (28));
     tabLine = area.removeFromTop (2);
     area.removeFromTop (12);
+
+    // Analog heat page: tape knobs in a row, below transport / vinyl and the output stages
+    {
+        auto page = area;
+        tapePanel = page.removeFromTop (page.getHeight() / 2 - 6);
+        page.removeFromTop (12);
+        transportPanel = page.removeFromLeft (page.getWidth() * 3 / 5 - 6);
+        page.removeFromLeft (12);
+        outputPanel = page;
+
+        const auto placeRow = [] (juce::Rectangle<int> r, auto& knobs, size_t first, size_t count)
+        {
+            r = r.reduced (10).withTrimmedTop (22);
+            const int w = r.getWidth() / (int) count;
+            for (size_t i = first; i < first + count; ++i)
+            {
+                auto cell = r.removeFromLeft (w);
+                knobs[i].label.setBounds (cell.removeFromTop (32));
+                knobs[i].knob.setBounds (cell.withSizeKeepingCentre (juce::jmin (cell.getWidth(), 150), juce::jmin (cell.getHeight(), 150)));
+            }
+        };
+        placeRow (tapePanel, tapeKnobs, 0, tapeKnobs.size());
+        placeRow (transportPanel, heatKnobs, 0, 3);
+        placeRow (outputPanel, heatKnobs, 3, 2);
+    }
 
     // Dynamics page: the bands, the DYNAMICS knob on the right
     {

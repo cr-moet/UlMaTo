@@ -10,6 +10,14 @@ namespace ParamIDs
     inline constexpr const char* response = "response";   // time constant of the live analysis (s)
     inline constexpr const char* dynamics = "dynamics";   // dynamics match amount 0 ... 100 %
     inline constexpr const char* bypass   = "bypass";
+
+    // Analog heat (all 0 ... 100 %)
+    inline constexpr const char* tape[] { "tape1", "tape2", "tape3", "tape4", "tape5" };
+    inline constexpr const char* wow         = "wow";
+    inline constexpr const char* flutter     = "flutter";
+    inline constexpr const char* crackle     = "crackle";
+    inline constexpr const char* tube        = "tube";
+    inline constexpr const char* transformer = "transformer";
 }
 
 //==============================================================================
@@ -20,8 +28,9 @@ namespace ParamIDs
 // way (LEARN); MATCH then moves the signal towards the reference with a static
 // correction (learned input -> reference) followed by a dynamic one that follows
 // the music. The dynamics of the reference in five bands are matched by a multiband
-// compressor / expander with its own amount (DYNAMICS); EQ and dynamics can run in
-// either order. See MatchEngine and Dynamics.
+// compressor / expander with its own amount (DYNAMICS). ANALOG adds tape, wow/flutter,
+// vinyl crackle, a tube and a transformer stage. The three stages can run in any order.
+// See MatchEngine, Dynamics and Analog.
 // Bypass: cross-fade to the input, delayed by the latency.
 //==============================================================================
 class UlMaToProcessor final : public juce::AudioProcessor
@@ -87,8 +96,8 @@ public:
     Spectrum::Profile getOutputProfile() const             { return engine.getOutputProfile(); }
 
     // Order of the stages (message thread; stored with the project)
-    void setDynamicsFirst (bool first);
-    bool isDynamicsFirst() const;
+    void setStageOrder (const MatchEngine::Order& order);
+    MatchEngine::Order getStageOrder() const;
 
     // Dynamics: live input / output distributions, slopes and current gain per band
     MatchEngine::DynamicsState getDynamicsState() const    { return engine.getDynamicsState(); }
@@ -106,6 +115,12 @@ private:
     std::atomic<float>* responseParam = nullptr;
     std::atomic<float>* dynamicsParam = nullptr;
     juce::AudioParameterBool* bypassParam = nullptr;
+    std::array<std::atomic<float>*, Dynamics::numBands> tapeParams {};
+    std::atomic<float>* wowParam = nullptr;
+    std::atomic<float>* flutterParam = nullptr;
+    std::atomic<float>* crackleParam = nullptr;
+    std::atomic<float>* tubeParam = nullptr;
+    std::atomic<float>* transformerParam = nullptr;
 
     // Bypass: the input delayed by the latency, cross-fade over 20 ms
     juce::AudioBuffer<float> dryDelay, dryBlock;

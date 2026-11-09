@@ -293,18 +293,14 @@ namespace Dynamics
     // before the lookahead delay, the bands are taken from the delayed signal, so
     // the gain is in place when a transient arrives.
     //
-    // Gain per band (dB) = downward part + upward part:
-    //  - downward, from the fast detector, at most -12 dB:
-    //      slope < 1 (compression): (slope - 1) * (level - pivot) above the pivot,
-    //      slope > 1 (expansion):   (slope - 1) * (level - pivot) below the pivot (fading
-    //                               out from 24 to 36 dB below it),
-    //  - upward (compression only), at most +4 dB: (1 - slope) * (pivot - level), from the
-    //    level smoothed over 100 ms, and
-    //      - only for a band that is there: full down to 12 dB below the pivot, none from
-    //        20 dB below (a missing band is never raised),
-    //      - none while the band keeps falling fast (decay, dropout): full below 12 dB/s,
-    //        none above 25 dB/s; a level that has settled lower is raised,
-    //      - rising at most 15 dB/s, falling at 60 dB/s.
+    // Gain per band (dB) = downward part (fast detector, at most -12 dB) + upward part
+    // (level smoothed over 100 ms, at most +4 dB, rising at most 15 dB/s, falling 60 dB/s):
+    //  - slope < 1 (input more dynamic, compression): down above the centre, up below it -
+    //    but only for a band that is there (full down to 12 dB below the centre, none
+    //    from 20 dB below: a missing band is never raised) and not while it is being cut
+    //    off (its level falling faster than 12 ... 25 dB/s, e.g. the start of a pause),
+    //  - slope > 1 (input flatter, expansion): up above the centre, down below it (fading
+    //    out from 24 to 36 dB below).
     // The detector readings (100 per second) are passed on to the engine thread, which
     // builds the live level distribution of the signal at this point from them.
     class Matcher
@@ -320,7 +316,6 @@ namespace Dynamics
             readingInterval = juce::jmax (1, juce::roundToInt (sampleRate / readingsPerSecond));
             updatesPerSecond = (float) sampleRate / (float) gainInterval;
             smoothCoefficient = 1.0f - std::exp (-1.0f / (updatesPerSecond * 0.1f));
-            rateCoefficient   = 1.0f - std::exp (-1.0f / (updatesPerSecond * 0.1f));
             upRiseStep = 15.0f / updatesPerSecond;
             upFallStep = 60.0f / updatesPerSecond;
             reset();
@@ -335,9 +330,9 @@ namespace Dynamics
             pivot.fill (-30.0f);
             gain.fill (1.0f);
             gainStep.fill (0.0f);
+            smoothPower.fill (0.0f);
             previous.fill (-120.0f);
             fallRate.fill (0.0f);
-            smoothPower.fill (0.0f);
             up.fill (0.0f);
             fade = 0.0f;
             counter = readingCounter = 0;
@@ -427,21 +422,17 @@ namespace Dynamics
                 const float down = slope[b] < 1.0f ? (slope[b] - 1.0f) * juce::jmax (0.0f, d)
                                                    : (slope[b] - 1.0f) * juce::jmin (0.0f, d) * juce::jlimit (0.0f, 1.0f, (d + 36.0f) / 12.0f);
 
-                // Upward part from a smoothed level (100 ms, no flutter) and its falling speed
-                // (dB/s, smoothed): a level that keeps falling fast is a decay or a dropout,
-                // a level that has settled lower is a quieter passage
                 smoothPower[b] += smoothCoefficient * (detector.getPower (b) - smoothPower[b]);
-                const float smooth = 10.0f * std::log10 (smoothPower[b] + 1.0e-12f);
-                fallRate[b] += rateCoefficient * (juce::jmax (0.0f, previous[b] - smooth) * updatesPerSecond - fallRate[b]);
-                previous[b] = smooth;
-                float upTarget = 0.0f;
-                if (slope[b] < 1.0f)
-                {
-                    const float below = pivot[b] - smooth;
-                    upTarget = juce::jmin (maxBoostDb, (1.0f - slope[b]) * juce::jlimit (0.0f, 12.0f, below))
-                             * juce::jlimit (0.0f, 1.0f, (20.0f - below) / 8.0f)         // band is there
-                             * juce::jlimit (0.0f, 1.0f, (25.0f - fallRate[b]) / 13.0f);     // not falling away
-                }
+                const float smoothDb = 10.0f * std::log10 (smoothPower[b] + 1.0e-12f);
+                fallRate[b] += smoothCoefficient * (juce::jmax (0.0f, previous[b] - smoothDb) * updatesPerSecond - fallRate[b]);
+                previous[b] = smoothDb;
+
+                const float ds = juce::jlimit (-36.0f, 24.0f, smoothDb - pivot[b]);
+                const float upTarget = juce::jmin (maxBoostDb,
+                    slope[b] < 1.0f ? (1.0f - slope[b]) * juce::jlimit (0.0f, 12.0f, -ds)
+                                        * juce::jlimit (0.0f, 1.0f, (ds + 20.0f) / 8.0f)              // band is there
+                                        * juce::jlimit (0.0f, 1.0f, (25.0f - fallRate[b]) / 13.0f)    // not cut off
+                                    : (slope[b] - 1.0f) * juce::jmax (0.0f, ds));
                 up[b] += juce::jlimit (-upFallStep, upRiseStep, upTarget - up[b]);
 
                 const float gainDb = juce::jmax (-maxCutDb, down) + up[b];
@@ -454,7 +445,7 @@ namespace Dynamics
         Splitter splitter, detectorSplitter;
         Detector detector;
         Values slope {}, pivot {}, gain {}, gainStep {}, smoothPower {}, previous {}, fallRate {}, up {};
-        float updatesPerSecond = 6000.0f, smoothCoefficient = 0.0f, rateCoefficient = 0.0f, upRiseStep = 0.0f, upFallStep = 0.0f;
+        float updatesPerSecond = 6000.0f, smoothCoefficient = 0.0f, upRiseStep = 0.0f, upFallStep = 0.0f;
         std::array<std::atomic<float>, numBands> targetSlope, targetPivot, gainsDb;
         float smoothing = 0.0f, fade = 0.0f, fadeStep = 0.0f;
         bool needed = false;
