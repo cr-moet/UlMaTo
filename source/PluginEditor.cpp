@@ -13,6 +13,7 @@ UlMaToEditor::UlMaToEditor (UlMaToProcessor& p)
 
     bypassButton.setClickingTogglesState (true);
     bypassButton.getProperties().set ("led", true);
+    bypassButton.getProperties().set ("ledInverted", true);   // lit = plugin active
     addAndMakeVisible (bypassButton);
 
     // Tabs: click = page, drag = order of the stages

@@ -108,8 +108,10 @@ public:
 
         if (led)
         {
+            // "ledInverted": the LED shows the opposite (BYPASS: lit while the plugin is active)
+            const bool lit = button.getToggleState() != (bool) button.getProperties()["ledInverted"];
             const auto face = buttonFaceArea (button.getLocalBounds().toFloat(), sunk);
-            drawLed (g, juce::Rectangle<float> (16.0f, 4.0f).withCentre ({ face.getCentreX(), face.getY() + 6.0f }), button.getToggleState());
+            drawLed (g, juce::Rectangle<float> (16.0f, 4.0f).withCentre ({ face.getCentreX(), face.getY() + 6.0f }), lit);
         }
     }
 
@@ -188,12 +190,12 @@ public:
         const float skirt = radius * 0.70f;
         constexpr int edges = 16;
         g.setColour (juce::Colours::black.withAlpha (0.25f * alpha));
-        g.fillPath (polygon (skirt + 1.0f, edges, 0.0f, { skirt * 0.05f, skirt * 0.12f }));
+        g.fillPath (polygon (skirt + 1.0f, edges, angle, { skirt * 0.05f, skirt * 0.12f }));
         g.setColour (juce::Colour (0xff2a2a2a));
-        g.fillPath (polygon (skirt, edges, 0.0f));
-        for (int i = 0; i < edges; ++i)
+        g.fillPath (polygon (skirt, edges, angle));
+        for (int i = 0; i < edges; ++i)   // the whole knob turns with the value: the facets move, the light stays
         {
-            const float a0 = juce::MathConstants<float>::twoPi * (float) i / (float) edges, a1 = a0 + juce::MathConstants<float>::twoPi / (float) edges;
+            const float a0 = angle + juce::MathConstants<float>::twoPi * (float) i / (float) edges, a1 = a0 + juce::MathConstants<float>::twoPi / (float) edges;
             const auto p0 = centre + juce::Point<float> (std::sin (a0), -std::cos (a0)) * skirt;
             const auto p1 = centre + juce::Point<float> (std::sin (a1), -std::cos (a1)) * skirt;
             const auto q0 = centre + juce::Point<float> (std::sin (a0), -std::cos (a0)) * (skirt * 0.78f);
@@ -207,7 +209,7 @@ public:
             g.drawLine ({ p0, q0 }, 1.2f);
         }
         g.setColour (juce::Colours::black.withAlpha (0.6f));
-        g.strokePath (polygon (skirt, edges, 0.0f), juce::PathStrokeType (1.0f));
+        g.strokePath (polygon (skirt, edges, angle), juce::PathStrokeType (1.0f));
 
         // Flat top with a hard edge and faint brushed rings
         const float topRadius = skirt * 0.76f;
