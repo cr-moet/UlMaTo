@@ -32,12 +32,29 @@ namespace Spectrum
     }
 
     //==========================================================================
-    // Result of an analysis: power per band (linear) and the correlation of L and R
-    // per band (+1 = mono / in phase, 0 = unrelated, -1 = out of phase)
+    // Result of an analysis: power per band (linear) of L, R, mid, side and the
+    // cross spectrum of L and R (complex), from which correlation and phase follow
     struct Profile
     {
-        Curve left {}, right {}, mid {}, side {}, correlation {};
+        Curve left {}, right {}, mid {}, side {}, crossRe {}, crossIm {};
         bool valid = false;
+
+        // +1 = mono / in phase, 0 = unrelated, -1 = out of phase
+        float correlation (size_t b) const
+        {
+            const float lr = left[b] * right[b];
+            return lr > 1.0e-30f ? juce::jlimit (-1.0f, 1.0f, crossRe[b] / std::sqrt (lr)) : 0.0f;
+        }
+
+        // How consistent the phase between L and R is (0 ... 1)
+        float coherence (size_t b) const
+        {
+            const float lr = left[b] * right[b];
+            return lr > 1.0e-30f ? juce::jmin (1.0f, std::hypot (crossRe[b], crossIm[b]) / std::sqrt (lr)) : 0.0f;
+        }
+
+        // Average phase difference of L against R (radians)
+        float phase (size_t b) const   { return std::atan2 (crossIm[b], crossRe[b]); }
 
         // Average level of the mid signal (dB) in the range that matters for the tonal
         // balance; profiles are compared relative to it, so loudness does not matter
@@ -58,7 +75,8 @@ namespace Spectrum
     //==========================================================================
     // Short-time FFT analyser (8192 points, Hann window, 75 % overlap). Frames are added one by one;
     // with decay = 1 all frames count equally (reference song), with decay < 1 older
-    // frames fade out exponentially (live signal).
+    // frames fade out exponentially (live signal). Optionally a second, fast average of
+    // mid and side is kept in the same pass (to detect bands that drop out or return).
     class Analyser final
     {
     public:
@@ -73,22 +91,22 @@ namespace Spectrum
                                                                       juce::dsp::WindowingFunction<float>::hann, false);
             for (auto* v : { &fftL, &fftR })
                 v->resize ((size_t) size * 2);
-            for (auto* v : { &powL, &powR, &powM, &powS, &cross })
+            for (auto* v : { &powL, &powR, &powM, &powS, &crossRe, &crossIm, &fastM, &fastS })
                 v->resize ((size_t) size / 2 + 1);
             reset();
         }
 
         void reset()
         {
-            for (auto* v : { &powL, &powR, &powM, &powS, &cross })
+            for (auto* v : { &powL, &powR, &powM, &powS, &crossRe, &crossIm, &fastM, &fastS })
                 std::fill (v->begin(), v->end(), 0.0);
-            weight = 0.0;
+            weight = fastWeight = 0.0;
         }
 
         bool hasData() const  { return weight > 0.0; }
 
-        // l and r point to 'size' samples each
-        void addFrame (const float* l, const float* r, double decay = 1.0)
+        // l and r point to 'size' samples each; fastDecay > 0 also updates the fast average
+        void addFrame (const float* l, const float* r, double decay = 1.0, double fastDecay = 0.0)
         {
             for (int i = 0; i < size; ++i)
             {
@@ -106,13 +124,31 @@ namespace Spectrum
                 const double mr = 0.5 * (lr + rr), mi = 0.5 * (li + ri);
                 const double sr = 0.5 * (lr - rr), si = 0.5 * (li - ri);
 
-                powL[k]  = powL[k]  * decay + lr * lr + li * li;
-                powR[k]  = powR[k]  * decay + rr * rr + ri * ri;
-                powM[k]  = powM[k]  * decay + mr * mr + mi * mi;
-                powS[k]  = powS[k]  * decay + sr * sr + si * si;
-                cross[k] = cross[k] * decay + lr * rr + li * ri;   // Re (L * conj (R))
+                powL[k]    = powL[k]    * decay + lr * lr + li * li;
+                powR[k]    = powR[k]    * decay + rr * rr + ri * ri;
+                powM[k]    = powM[k]    * decay + mr * mr + mi * mi;
+                powS[k]    = powS[k]    * decay + sr * sr + si * si;
+                crossRe[k] = crossRe[k] * decay + lr * rr + li * ri;   // L * conj (R)
+                crossIm[k] = crossIm[k] * decay + li * rr - lr * ri;
+
+                if (fastDecay > 0.0)
+                {
+                    fastM[k] = fastM[k] * fastDecay + mr * mr + mi * mi;
+                    fastS[k] = fastS[k] * fastDecay + sr * sr + si * si;
+                }
             }
             weight = weight * decay + 1.0;
+            if (fastDecay > 0.0)
+                fastWeight = fastWeight * fastDecay + 1.0;
+        }
+
+        // Fast average of mid and side (power per band, same scale as getProfile)
+        void getFastMidSide (double sampleRate, Curve& mid, Curve& side) const
+        {
+            if (fastWeight <= 0.0)
+                return;
+            mid  = bands (fastM, scaleFor (fastWeight), sampleRate);
+            side = bands (fastS, scaleFor (fastWeight), sampleRate);
         }
 
         // Band profile of the frames added so far
@@ -122,50 +158,59 @@ namespace Spectrum
             if (weight <= 0.0)
                 return p;
 
-            // Scaling: a full-scale sine gives about 0 dB in its bin
-            const double windowSum = std::accumulate (window.begin(), window.end(), 0.0);
-            const double scale     = 4.0 / (windowSum * windowSum) / weight;
-            const double binHz     = sampleRate / size;
-            const auto   lastBin   = (double) (size / 2);
-
-            for (int b = 0; b < numBands; ++b)
-            {
-                // Average of the bins inside the band; narrow low bands without a bin
-                // centre are interpolated between the neighbouring bins
-                const double lo = bandFrequency ((float) b - 0.5f) / binHz;
-                const double hi = bandFrequency ((float) b + 0.5f) / binHz;
-                const double centre = juce::jmin ((double) bandFrequency ((float) b) / binHz, lastBin);
-                const auto first = (size_t) std::ceil (lo), last = (size_t) juce::jmin (std::floor (hi), lastBin);
-
-                const auto bandValue = [&] (const std::vector<double>& v)
-                {
-                    if (first <= last && lo <= lastBin)
-                        return std::accumulate (v.begin() + (long) first, v.begin() + (long) last + 1, 0.0) / (double) (last - first + 1);
-
-                    const auto k0 = (size_t) centre;
-                    const auto k1 = juce::jmin (k0 + 1, (size_t) lastBin);
-                    const double f = centre - (double) k0;
-                    return v[k0] + f * (v[k1] - v[k0]);
-                };
-
-                const double l = bandValue (powL), r = bandValue (powR);
-                p.left[(size_t) b]  = (float) (l * scale);
-                p.right[(size_t) b] = (float) (r * scale);
-                p.mid[(size_t) b]   = (float) (bandValue (powM) * scale);
-                p.side[(size_t) b]  = (float) (bandValue (powS) * scale);
-                p.correlation[(size_t) b] = l * r > 1.0e-30 ? (float) juce::jlimit (-1.0, 1.0, bandValue (cross) / std::sqrt (l * r))
-                                                            : 0.0f;
-            }
-
+            const double scale = scaleFor (weight);
+            p.left    = bands (powL,    scale, sampleRate);
+            p.right   = bands (powR,    scale, sampleRate);
+            p.mid     = bands (powM,    scale, sampleRate);
+            p.side    = bands (powS,    scale, sampleRate);
+            p.crossRe = bands (crossRe, scale, sampleRate);
+            p.crossIm = bands (crossIm, scale, sampleRate);
             p.valid = true;
             return p;
         }
 
     private:
+        // Scaling: a full-scale sine gives about 0 dB in its bin
+        double scaleFor (double w) const
+        {
+            const double windowSum = std::accumulate (window.begin(), window.end(), 0.0);
+            return 4.0 / (windowSum * windowSum) / w;
+        }
+
+        // Bins -> bands: average of the bins inside a band; narrow low bands without a
+        // bin centre are interpolated between the neighbouring bins
+        static Curve bands (const std::vector<double>& v, double scale, double sampleRate)
+        {
+            Curve c {};
+            const double binHz   = sampleRate / size;
+            const auto   lastBin = (double) (size / 2);
+
+            for (int b = 0; b < numBands; ++b)
+            {
+                const double lo = bandFrequency ((float) b - 0.5f) / binHz;
+                const double hi = bandFrequency ((float) b + 0.5f) / binHz;
+                const double centre = juce::jmin ((double) bandFrequency ((float) b) / binHz, lastBin);
+                const auto first = (size_t) std::ceil (lo), last = (size_t) juce::jmin (std::floor (hi), lastBin);
+
+                double value;
+                if (first <= last && lo <= lastBin)
+                    value = std::accumulate (v.begin() + (long) first, v.begin() + (long) last + 1, 0.0) / (double) (last - first + 1);
+                else
+                {
+                    const auto k0 = (size_t) centre;
+                    const auto k1 = juce::jmin (k0 + 1, (size_t) lastBin);
+                    value = v[k0] + (centre - (double) k0) * (v[k1] - v[k0]);
+                }
+                c[(size_t) b] = (float) (value * scale);
+            }
+            return c;
+        }
+
         juce::dsp::FFT fft { order };
         std::vector<float> window, fftL, fftR;
-        std::vector<double> powL, powR, powM, powS, cross;   // per bin, summed over the frames
-        double weight = 0.0;
+        std::vector<double> powL, powR, powM, powS, crossRe, crossIm;   // per bin, summed over the frames
+        std::vector<double> fastM, fastS;                                // fast average of mid and side
+        double weight = 0.0, fastWeight = 0.0;
 
         JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (Analyser)
     };

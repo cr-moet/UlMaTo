@@ -14,9 +14,10 @@ namespace ParamIDs
 // UlMaTo - Ultimate Mastering Tool
 //
 // A reference song is analysed (long-term spectrum of L/R, mid/side and the phase
-// correlation per band). The signal running through the plugin is analysed
-// continuously, and a linear-phase mid/side EQ moves its tonal balance and stereo
-// image towards the reference by the selected amount.
+// between the channels per band). The input of the plugin can be learned in the same
+// way (LEARN); MATCH then moves the signal towards the reference with a static
+// correction (learned input -> reference) followed by a dynamic one that follows
+// the music. See MatchEngine.
 //==============================================================================
 class UlMaToProcessor final : public juce::AudioProcessor
 {
@@ -66,6 +67,12 @@ public:
     // with every new result, so the display knows when to update
     Spectrum::Profile getReferenceProfile() const;
     int getReferenceVersion() const noexcept               { return referenceVersion.load(); }
+
+    // LEARN: analyse the input of the plugin while switched on
+    void setLearning (bool shouldLearn)                    { engine.setLearning (shouldLearn); }
+    bool isLearning() const noexcept                       { return engine.isLearning(); }
+    Spectrum::Profile getLearnedProfile() const            { return engine.getLearned(); }
+    int getLearnedVersion() const noexcept                 { return engine.getLearnedVersion(); }
 
     // Spectrum of the processed signal (for the display)
     Spectrum::Profile getOutputProfile() const             { return engine.getOutputProfile(); }

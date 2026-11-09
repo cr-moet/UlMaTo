@@ -246,7 +246,8 @@ private:
 };
 
 //==============================================================================
-// Result of the reference analysis: stereo (L/R), mid/side or phase correlation
+// Result of the reference analysis: stereo (L/R), mid/side or phase correlation;
+// the learned input (LEARN) is drawn dashed for comparison
 //==============================================================================
 class ProfileView final : public juce::Component
 {
@@ -255,7 +256,12 @@ public:
 
     ProfileView (Kind k, juce::String t) : kind (k), title (std::move (t)) {}
 
-    void setProfile (const Spectrum::Profile& p)  { profile = p; repaint(); }
+    void setProfiles (const Spectrum::Profile& ref, const Spectrum::Profile& learnedInput)
+    {
+        profile = ref;
+        learned = learnedInput;
+        repaint();
+    }
 
     void paint (juce::Graphics& g) override
     {
@@ -271,30 +277,47 @@ public:
         const float top = phase ? 1.0f : 0.0f, bottom = phase ? -1.0f : -96.0f;
         Plot::drawGrid (g, plot, top, bottom, phase ? 0.5f : 12.0f, true);
 
-        if (! profile.valid)
+        if (! profile.valid && ! learned.valid)
         {
             g.setColour (Colours::text.withAlpha (0.45f));
             g.drawText ("Not analysed yet", plot, juce::Justification::centred);
             return;
         }
 
-        const auto db = [] (const Spectrum::Curve& c) { return [&c] (int b) { return Spectrum::toDb (c[(size_t) b]); }; };
+        // Learned input first (dashed, lighter), then the reference on top
+        for (const auto* p : { &learned, &profile })
+        {
+            if (! p->valid)
+                continue;
 
+            const bool dashed = p == &learned;
+            const float alpha = dashed ? 0.6f : 1.0f, width = dashed ? 1.2f : 1.5f;
+            const auto db = [] (const Spectrum::Curve& c) { return [&c] (int b) { return Spectrum::toDb (c[(size_t) b]); }; };
+
+            switch (kind)
+            {
+                case Kind::stereo:
+                    Plot::drawCurve (g, plot, top, bottom, Colours::text.withAlpha (alpha), width, dashed, db (p->right));
+                    Plot::drawCurve (g, plot, top, bottom, Colours::accent.withAlpha (alpha), width, dashed, db (p->left));
+                    break;
+                case Kind::midSide:
+                    Plot::drawCurve (g, plot, top, bottom, Colours::text.withAlpha (alpha), width, dashed, db (p->side));
+                    Plot::drawCurve (g, plot, top, bottom, Colours::accent.withAlpha (alpha), width, dashed, db (p->mid));
+                    break;
+                case Kind::phase:
+                    Plot::drawCurve (g, plot, top, bottom, Colours::accent.withAlpha (alpha), width, dashed,
+                                     [p] (int b) { return p->correlation ((size_t) b); });
+                    break;
+            }
+        }
+
+        const auto inputHint = juce::String (learned.valid ? "   - - INPUT" : "");
         switch (kind)
         {
-            case Kind::stereo:
-                Plot::drawCurve (g, plot, top, bottom, Colours::text, 1.5f, false, db (profile.right));
-                Plot::drawCurve (g, plot, top, bottom, Colours::accent, 1.5f, false, db (profile.left));
-                Plot::drawLegend (g, plot, { { "L", Colours::accent }, { "R", Colours::text } });
-                break;
-            case Kind::midSide:
-                Plot::drawCurve (g, plot, top, bottom, Colours::text, 1.5f, false, db (profile.side));
-                Plot::drawCurve (g, plot, top, bottom, Colours::accent, 1.5f, false, db (profile.mid));
-                Plot::drawLegend (g, plot, { { "MID", Colours::accent }, { "SIDE", Colours::text } });
-                break;
+            case Kind::stereo:  Plot::drawLegend (g, plot, { { "L", Colours::accent }, { "R", Colours::text }, { inputHint, Colours::text.withAlpha (0.6f) } }); break;
+            case Kind::midSide: Plot::drawLegend (g, plot, { { "MID", Colours::accent }, { "SIDE", Colours::text }, { inputHint, Colours::text.withAlpha (0.6f) } }); break;
             case Kind::phase:
-                Plot::drawCurve (g, plot, top, bottom, Colours::accent, 1.5f, false,
-                                 [this] (int b) { return profile.correlation[(size_t) b]; });
+                Plot::drawLegend (g, plot, { { inputHint, Colours::text.withAlpha (0.6f) } });
                 g.setColour (Colours::text.withAlpha (0.55f));
                 g.setFont (juce::Font (juce::FontOptions (10.0f)));
                 g.drawText ("+1 mono    0 wide    -1 out of phase", plot.reduced (6.0f, 3.0f), juce::Justification::bottomLeft);
@@ -305,14 +328,14 @@ public:
 private:
     Kind kind;
     juce::String title;
-    Spectrum::Profile profile;
+    Spectrum::Profile profile, learned;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (ProfileView)
 };
 
 //==============================================================================
 // Spectrum of the processed signal (after the MATCH knob) in dBFS; the reference is
-// drawn dashed, moved to the level of the signal so the shapes can be compared
+// drawn dashed at its own level (static)
 //==============================================================================
 class LiveView final : public juce::Component,
                        private juce::Timer
@@ -334,13 +357,12 @@ public:
         Plot::drawPanel (g, plot);
         Plot::drawGrid (g, plot, top, bottom, 12.0f, true);
 
-        if (reference.valid && live.valid)
+        if (reference.valid)
         {
-            const float shift = live.referenceLevelDb() - reference.referenceLevelDb();
             Plot::drawCurve (g, plot, top, bottom, Colours::text.withAlpha (0.55f), 1.2f, true,
-                             [&] (int b) { return Spectrum::toDb (reference.side[(size_t) b]) + shift; });
+                             [&] (int b) { return Spectrum::toDb (reference.side[(size_t) b]); });
             Plot::drawCurve (g, plot, top, bottom, Colours::accent.withAlpha (0.6f), 1.2f, true,
-                             [&] (int b) { return Spectrum::toDb (reference.mid[(size_t) b]) + shift; });
+                             [&] (int b) { return Spectrum::toDb (reference.mid[(size_t) b]); });
         }
         if (live.valid)
         {
@@ -374,4 +396,49 @@ private:
     Spectrum::Profile live, reference;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (LiveView)
+};
+
+//==============================================================================
+// Status LED: off, blinking (busy) or on
+//==============================================================================
+class Led final : public juce::Component,
+                  private juce::Timer
+{
+public:
+    Led() = default;
+
+    enum class State { off, blinking, on };
+
+    void setState (State s)
+    {
+        if (s == state)
+            return;
+        state = s;
+        if (state == State::blinking) startTimerHz (3); else stopTimer();
+        blinkOn = true;
+        repaint();
+    }
+
+    void paint (juce::Graphics& g) override
+    {
+        const auto r = getLocalBounds().toFloat().withSizeKeepingCentre (14.0f, 14.0f);
+        const bool lit = state == State::on || (state == State::blinking && blinkOn);
+        g.setColour (Colours::text);
+        g.fillEllipse (r);
+        g.setColour (lit ? Colours::accent : Colours::text.brighter (0.3f));
+        g.fillEllipse (r.reduced (2.5f));
+        if (lit)
+        {
+            g.setColour (juce::Colours::white.withAlpha (0.45f));
+            g.fillEllipse (r.reduced (5.0f).translated (-1.0f, -1.0f));
+        }
+    }
+
+private:
+    void timerCallback() override  { blinkOn = ! blinkOn; repaint(); }
+
+    State state = State::off;
+    bool blinkOn = true;
+
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (Led)
 };

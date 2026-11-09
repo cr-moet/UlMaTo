@@ -2,53 +2,99 @@
 
 namespace
 {
-    // Correction per band (dB) that turns the live tonal balance into the reference.
-    // Both profiles are taken relative to their own average mid level, so only the
-    // balance is matched, not the loudness. Mid and side use the same reference level,
-    // so the side/mid ratio (stereo width, phase correlation) is matched as well.
-    void calculateCorrection (const Spectrum::Profile& ref, const Spectrum::Profile& live,
-                              Spectrum::Curve& mid, Spectrum::Curve& side)
+    using namespace Spectrum;
+
+    constexpr float floorDb        = -60.0f;   // relative level below which a band counts as empty
+    constexpr float maxStaticDb    = 12.0f;    // limits per band
+    constexpr float maxDynamicDb   = 9.0f;
+    constexpr float maxPhase       = juce::MathConstants<float>::halfPi;
+    constexpr float boostDbPerSec  = 4.0f;     // dynamic part: gain may rise slowly ...
+    constexpr float cutDbPerSec    = 24.0f;    // ... and fall quickly
+    constexpr float holdDb         = 6.0f;     // current level this far from the average: hold
+    constexpr float absentDb       = 10.0f;    // average this far below the long-term level: hold
+    constexpr double fastSeconds   = 0.15;     // time constant of the current level
+    constexpr double longSeconds   = 10.0;     // time constant of the long-term level
+
+    float powerGain (float db)   { return std::pow (10.0f, db * 0.1f); }
+
+    // 1/3-octave smoothing (+-2 bands) and limiting, so the EQ has no narrow peaks or notches
+    Curve smooth (const Curve& raw, float limit)
     {
-        using namespace Spectrum;
-        constexpr float floorDb = -60.0f;   // below this (relative) a band is treated as empty
-
-        const float refLevel  = ref.referenceLevelDb();
-        const float liveLevel = live.referenceLevelDb();
-
-        Curve rawMid {}, rawSide {};
-        for (size_t b = 0; b < (size_t) numBands; ++b)
-        {
-            const auto diff = [&] (float refPower, float livePower)
-            {
-                const float r = toDb (refPower) - refLevel, l = toDb (livePower) - liveLevel;
-                // Empty bands are not corrected: boosting silence or noise does not help
-                return r > floorDb && l > floorDb ? r - l : 0.0f;
-            };
-            rawMid[b]  = diff (ref.mid[b],  live.mid[b]);
-            rawSide[b] = diff (ref.side[b], live.side[b]);
-        }
-
-        // Smoothing over 1/3 octave (+-2 bands), so the EQ has no narrow peaks or notches
-        constexpr int radius = 2;
+        Curve out {};
         for (int b = 0; b < numBands; ++b)
         {
-            float m = 0.0f, s = 0.0f;
+            float sum = 0.0f;
             int count = 0;
-            for (int i = juce::jmax (0, b - radius); i <= juce::jmin (numBands - 1, b + radius); ++i, ++count)
-            {
-                m += rawMid[(size_t) i];
-                s += rawSide[(size_t) i];
-            }
-            mid[(size_t) b]  = juce::jlimit (-MatchEngine::maxCorrectionDb, MatchEngine::maxCorrectionDb, m / (float) count);
-            side[(size_t) b] = juce::jlimit (-MatchEngine::maxCorrectionDb, MatchEngine::maxCorrectionDb, s / (float) count);
+            for (int i = juce::jmax (0, b - 2); i <= juce::jmin (numBands - 1, b + 2); ++i, ++count)
+                sum += raw[(size_t) i];
+            out[(size_t) b] = juce::jlimit (-limit, limit, sum / (float) count);
         }
+        return out;
     }
 
-    float maxDifference (const Spectrum::Curve& a, const Spectrum::Curve& b)
+    // Correction (dB) that turns one curve into the reference, both relative to their own
+    // average mid level (only the balance is matched, not the loudness). Empty bands: 0.
+    Curve matchCurve (const Curve& ref, float refLevel, const Curve& in, float inLevel, float limit)
+    {
+        Curve raw {};
+        for (size_t b = 0; b < (size_t) numBands; ++b)
+        {
+            const float r = toDb (ref[b]) - refLevel, l = toDb (in[b]) - inLevel;
+            raw[b] = r > floorDb && l > floorDb ? r - l : 0.0f;
+        }
+        return smooth (raw, limit);
+    }
+
+    // Profile as it is after the left/right gains, the phase and the mid/side gains of a correction
+    Profile applyCorrection (const Profile& p, const MatchEngine::Correction& c)
+    {
+        Profile q = p;
+        for (size_t b = 0; b < (size_t) numBands; ++b)
+        {
+            const float pl = powerGain (c.left[b]), pr = powerGain (c.right[b]);
+            const float g = std::sqrt (pl * pr), cs = std::cos (c.phase[b]), sn = std::sin (c.phase[b]);
+            q.left[b]    = p.left[b] * pl;
+            q.right[b]   = p.right[b] * pr;
+            q.crossRe[b] = g * (p.crossRe[b] * cs - p.crossIm[b] * sn);
+            q.crossIm[b] = g * (p.crossRe[b] * sn + p.crossIm[b] * cs);
+
+            const float sum = q.left[b] + q.right[b];
+            q.mid[b]  = juce::jmax (0.0f, 0.25f * (sum + 2.0f * q.crossRe[b])) * powerGain (c.mid[b]);
+            q.side[b] = juce::jmax (0.0f, 0.25f * (sum - 2.0f * q.crossRe[b])) * powerGain (c.side[b]);
+        }
+        return q;
+    }
+
+    // Static correction from the learned input to the reference: first left/right and
+    // phase, then mid/side for what is left after that
+    MatchEngine::Correction calculateStatic (const Profile& ref, const Profile& in)
+    {
+        MatchEngine::Correction c;
+        const float refLevel = ref.referenceLevelDb(), inLevel = in.referenceLevelDb();
+        c.left  = matchCurve (ref.left,  refLevel, in.left,  inLevel, maxStaticDb);
+        c.right = matchCurve (ref.right, refLevel, in.right, inLevel, maxStaticDb);
+
+        // Phase between the channels: only where it is consistent in both signals
+        Curve phase {};
+        for (size_t b = 0; b < (size_t) numBands; ++b)
+            if (ref.coherence (b) > 0.5f && in.coherence (b) > 0.5f)
+                phase[b] = juce::jlimit (-maxPhase, maxPhase, std::remainder (ref.phase (b) - in.phase (b), juce::MathConstants<float>::twoPi));
+        c.phase = smooth (phase, maxPhase);
+
+        const auto after = applyCorrection (in, c);
+        const float afterLevel = after.referenceLevelDb();
+        c.mid  = matchCurve (ref.mid,  refLevel, after.mid,  afterLevel, maxStaticDb);
+        c.side = matchCurve (ref.side, refLevel, after.side, afterLevel, maxStaticDb);
+        return c;
+    }
+
+    float maxDifference (const MatchEngine::Correction& a, const MatchEngine::Correction& b)
     {
         float d = 0.0f;
-        for (size_t i = 0; i < a.size(); ++i)
-            d = juce::jmax (d, std::abs (a[i] - b[i]));
+        for (size_t i = 0; i < (size_t) numBands; ++i)
+            d = std::max ({ d, std::abs (a.left[i] - b.left[i]), std::abs (a.right[i] - b.right[i]),
+                            10.0f * std::abs (a.phase[i] - b.phase[i]),
+                            std::abs (a.mid[i] - b.mid[i]), std::abs (a.side[i] - b.side[i]) });
         return d;
     }
 }
@@ -73,7 +119,7 @@ void MatchEngine::Tap::push (const float* l, const float* r, int numSamples) noe
     }
 }
 
-void MatchEngine::Tap::read (double decay)
+void MatchEngine::Tap::read (double decay, double fastDecay, Spectrum::Analyser* alsoTo)
 {
     constexpr int size = Spectrum::Analyser::size, hop = Spectrum::Analyser::hop;
 
@@ -95,7 +141,11 @@ void MatchEngine::Tap::read (double decay)
         // Full frame. Silence (pauses, stopped transport) is skipped, so the analysis
         // and the correction stay as they are.
         if (frame.getRMSLevel (0, 0, size) + frame.getRMSLevel (1, 0, size) > 1.0e-4f)
-            analyser.addFrame (frame.getReadPointer (0), frame.getReadPointer (1), decay);
+        {
+            analyser.addFrame (frame.getReadPointer (0), frame.getReadPointer (1), decay, fastDecay);
+            if (alsoTo != nullptr)
+                alsoTo->addFrame (frame.getReadPointer (0), frame.getReadPointer (1));
+        }
 
         for (int ch = 0; ch < 2; ++ch)   // keep the newest samples for the next frame (regions overlap: memmove)
             std::memmove (frame.getWritePointer (ch), frame.getReadPointer (ch, hop), sizeof (float) * (size_t) (size - hop));
@@ -116,38 +166,41 @@ void MatchEngine::prepare (double newSampleRate, int)
     stopThread (4000);
 
     sampleRate = newSampleRate;
+    lookahead  = juce::jmax (1, juce::roundToInt (sampleRate * lookaheadMs * 0.001));
 
     // Filter length: about 85 ms (frequency resolution ~12 Hz), power of two
-    firLength = juce::nextPowerOfTwo ((int) (sampleRate * 0.085));
+    firLength    = juce::nextPowerOfTwo ((int) (sampleRate * 0.085));
     designFft    = std::make_unique<juce::dsp::FFT> (juce::roundToInt (std::log2 (firLength)));
     partitionFft = std::make_unique<juce::dsp::FFT> (juce::roundToInt (std::log2 (2 * blockSize)));
-    designData.assign ((size_t) firLength * 2, 0.0f);
+    for (auto& d : designData)
+        d.assign ((size_t) firLength * 2, 0.0f);
     designIr.assign ((size_t) firLength, 0.0f);
     designWindow.resize ((size_t) firLength);
     juce::dsp::WindowingFunction<float>::fillWindowingTables (designWindow.data(), (size_t) firLength,
                                                               juce::dsp::WindowingFunction<float>::blackman, false);
 
-    for (auto* c : { &midConvolver, &sideConvolver })
-        c->prepare (blockSize, firLength);
+    convolver.prepare (blockSize, firLength);
 
-    // Both slots start with a neutral filter (pure delay)
-    const Spectrum::Curve flat {};
-    for (auto& set : filters)
-    {
-        designFilter (flat, set.mid);
-        set.side = set.mid;
-    }
-    activeFilter = 0;
-    newFilter = false;
+    // Both slots start neutral (pure delay)
+    applied = {};
+    for (auto& f : filters)
+        designFilters (applied, f);
+    activeFilters = 0;
+    newFilters = false;
+    firstFilters = false;
 
-    for (auto* v : { &midBlock, &sideBlock, &midOut, &sideOut })
+    delayLine.setSize (2, lookahead);
+    delayLine.clear();
+    delayPosition = 0;
+    for (auto* v : { &blockL, &blockR, &outL, &outR })
         v->assign ((size_t) blockSize, 0.0f);
     blockPosition = 0;
 
     input.reset();
     output.reset();
-    appliedMid = appliedSide = flat;
-    filtersValid = true;
+    dynamicMid = dynamicSide = {};
+    longTermValid = false;
+    profilesChanged = true;
 
     prepared = true;
     startThread (juce::Thread::Priority::low);
@@ -159,13 +212,29 @@ void MatchEngine::release()
     prepared = false;
 }
 
-void MatchEngine::setReference (const Spectrum::Profile& newReference)
+void MatchEngine::setReference (const Spectrum::Profile& p)
 {
     {
         const juce::ScopedLock lock (stateLock);
-        reference = newReference;
+        reference = p;
     }
-    referenceChanged = true;
+    profilesChanged = true;
+}
+
+void MatchEngine::setLearned (const Spectrum::Profile& p)
+{
+    {
+        const juce::ScopedLock lock (stateLock);
+        learned = p;
+    }
+    profilesChanged = true;
+    ++learnedVersion;
+}
+
+Spectrum::Profile MatchEngine::getLearned() const
+{
+    const juce::ScopedLock lock (stateLock);
+    return learned;
 }
 
 Spectrum::Profile MatchEngine::getOutputProfile() const
@@ -187,37 +256,42 @@ void MatchEngine::process (juce::AudioBuffer<float>& buffer, float amount, float
     float* left  = buffer.getWritePointer (0);
     float* right = buffer.getNumChannels() > 1 ? buffer.getWritePointer (1) : left;
 
+    // The analysis gets the input now, the audio follows 10 ms later (lookahead)
     input.push (left, right, numSamples);
 
-    // Mid / side in internal blocks of 'blockSize' samples (output one block later)
+    float* delayL = delayLine.getWritePointer (0);
+    float* delayR = delayLine.getWritePointer (1);
+
     for (int i = 0; i < numSamples; ++i)
     {
-        const auto pos = (size_t) blockPosition;
-        midBlock[pos]  = 0.5f * (left[i] + right[i]);
-        sideBlock[pos] = 0.5f * (left[i] - right[i]);
-        left[i]  = midOut[pos] + sideOut[pos];
-        right[i] = midOut[pos] - sideOut[pos];   // mono: left == right == mid
+        const auto d = (size_t) delayPosition, b = (size_t) blockPosition;
+        blockL[b] = delayL[d];
+        blockR[b] = delayR[d];
+        delayL[d] = left[i];
+        delayR[d] = right[i];
+        delayPosition = (delayPosition + 1) % lookahead;
+
+        left[i] = outL[b];   // processed block, one block behind
+        if (right != left)
+            right[i] = outR[b];
 
         if (++blockPosition < blockSize)
             continue;
 
         blockPosition = 0;
 
-        // New filter from the engine thread: cross-fade within this block
-        const int active = activeFilter.load (std::memory_order_relaxed);
-        const bool change = newFilter.load (std::memory_order_acquire);
-        const auto& current = filters[(size_t) active];
-        const auto* next = change ? &filters[(size_t) (1 - active)] : nullptr;
-
-        midConvolver.process  (midBlock.data(),  current.mid.data(),  next != nullptr ? next->mid.data()  : nullptr);
-        sideConvolver.process (sideBlock.data(), current.side.data(), next != nullptr ? next->side.data() : nullptr);
-        std::swap (midBlock, midOut);
-        std::swap (sideBlock, sideOut);
+        // New filters from the engine thread: cross-fade within this block
+        const int active  = activeFilters.load (std::memory_order_relaxed);
+        const bool change = newFilters.load (std::memory_order_acquire);
+        convolver.process (blockL.data(), blockR.data(), filters[(size_t) active],
+                           change ? &filters[(size_t) (1 - active)] : nullptr);
+        std::swap (blockL, outL);
+        std::swap (blockR, outR);
 
         if (change)
         {
-            activeFilter.store (1 - active, std::memory_order_relaxed);
-            newFilter.store (false, std::memory_order_release);
+            activeFilters.store (1 - active, std::memory_order_relaxed);
+            newFilters.store (false, std::memory_order_release);
         }
     }
 
@@ -235,19 +309,21 @@ void MatchEngine::run()
 
     while (! threadShouldExit())
     {
+        updateLearning();
+
         // Exponential averaging per frame with the selected time constant
         const double frameSeconds = Spectrum::Analyser::hop / sampleRate;
         const double decay = std::exp (-frameSeconds / juce::jmax (0.05, (double) currentResponse.load()));
-        input.read (decay);
-        output.read (decay);
+        input.read (decay, std::exp (-frameSeconds / fastSeconds), learning.load() ? &learnAnalyser : nullptr);
+        output.read (decay, 0.0);
 
         const auto now = juce::Time::getMillisecondCounterHiRes();
         const float amount = currentAmount.load (std::memory_order_relaxed);
+        const double elapsed = (now - lastUpdate) * 0.001;
 
-        if (now - lastUpdate >= updateSeconds * 1000.0 || std::abs (amount - lastAmount) > 0.002f
-            || referenceChanged.exchange (false))
+        if (elapsed >= updateSeconds || std::abs (amount - lastAmount) > 0.002f || profilesChanged.load())
         {
-            updateFilters();
+            updateFilters (juce::jmin (elapsed, 0.5));
             lastUpdate = now;
             lastAmount = amount;
         }
@@ -256,38 +332,62 @@ void MatchEngine::run()
     }
 }
 
-void MatchEngine::updateFilters()
+// LEARN switched on: collect the input with equal weight; switched off: keep the result
+void MatchEngine::updateLearning()
 {
-    Spectrum::Profile ref;
+    const bool wanted = learnRequest.load();
+    if (wanted == learning.load())
+        return;
+
+    if (wanted)
+        learnAnalyser.reset();
+    else if (learnAnalyser.hasData())
+        setLearned (learnAnalyser.getProfile (sampleRate));
+
+    learning = wanted;
+}
+
+void MatchEngine::updateFilters (double seconds)
+{
+    Spectrum::Profile ref, learnedInput;
     {
         const juce::ScopedLock lock (stateLock);
         ref = reference;
+        learnedInput = learned;
     }
 
-    const auto live = input.analyser.hasData() ? input.analyser.getProfile (sampleRate) : Spectrum::Profile {};
+    if (profilesChanged.exchange (false))
+        staticCorrection = ref.valid && learnedInput.valid ? calculateStatic (ref, learnedInput) : Correction {};
 
-    Spectrum::Curve mid {}, side {};
-    if (ref.valid && live.valid)
-        calculateCorrection (ref, live, mid, side);
+    if (ref.valid && input.analyser.hasData())
+    {
+        Spectrum::Curve fastMid {}, fastSide {};
+        input.analyser.getFastMidSide (sampleRate, fastMid, fastSide);
+        updateDynamic (ref, input.analyser.getProfile (sampleRate), fastMid, fastSide, seconds);
+    }
+    else if (! ref.valid)
+        dynamicMid = dynamicSide = {};
 
+    // MATCH scales the static and the dynamic part
     const float amount = currentAmount.load (std::memory_order_relaxed);
-    for (size_t b = 0; b < mid.size(); ++b)
+    Correction c;
+    for (size_t b = 0; b < (size_t) numBands; ++b)
     {
-        mid[b]  *= amount;
-        side[b] *= amount;
+        c.left[b]  = amount * staticCorrection.left[b];
+        c.right[b] = amount * staticCorrection.right[b];
+        c.phase[b] = amount * staticCorrection.phase[b];
+        c.mid[b]   = amount * (staticCorrection.mid[b]  + dynamicMid[b]);
+        c.side[b]  = amount * (staticCorrection.side[b] + dynamicSide[b]);
     }
 
-    // New filters only when the curves have changed and the audio thread has taken
-    // the previous ones (otherwise the next update tries again)
-    if ((maxDifference (mid, appliedMid) > 0.02f || maxDifference (side, appliedSide) > 0.02f)
-        && ! newFilter.load (std::memory_order_acquire))
+    // New filters only when something changed and the audio thread has taken the
+    // previous ones (otherwise the next update tries again)
+    if ((firstFilters || maxDifference (c, applied) > 0.02f) && ! newFilters.load (std::memory_order_acquire))
     {
-        auto& set = filters[(size_t) (1 - activeFilter.load (std::memory_order_relaxed))];
-        designFilter (mid, set.mid);
-        designFilter (side, set.side);
-        newFilter.store (true, std::memory_order_release);
-        appliedMid  = mid;
-        appliedSide = side;
+        designFilters (c, filters[(size_t) (1 - activeFilters.load (std::memory_order_relaxed))]);
+        newFilters.store (true, std::memory_order_release);
+        applied = c;
+        firstFilters = false;
     }
 
     const auto out = output.analyser.hasData() ? output.analyser.getProfile (sampleRate) : Spectrum::Profile {};
@@ -295,24 +395,81 @@ void MatchEngine::updateFilters()
     outputProfile = out;
 }
 
-// Linear-phase FIR filter with the given magnitude response (dB per band):
-// symmetric spectrum -> inverse FFT -> zero-phase impulse response, centred and
-// windowed -> partition spectra for the convolution
-void MatchEngine::designFilter (const Spectrum::Curve& gainDb, std::vector<float>& spectra)
+// Dynamic part: compares the input as it sounds after the static part with the reference.
+// A band is held (its correction stays as it is)
+//  - while its current level differs from its average by more than holdDb: it drops out
+//    (e.g. a bass pause) or comes back and the average has not caught up yet,
+//  - while its average is more than absentDb below its long-term level: it is missing
+//    in this part of the song, however long that lasts.
+// So a missing band is never boosted, and nothing overshoots when it returns.
+void MatchEngine::updateDynamic (const Spectrum::Profile& ref, const Spectrum::Profile& live,
+                                 const Spectrum::Curve& fastMid, const Spectrum::Curve& fastSide, double seconds)
+{
+    const auto after = applyCorrection (live, staticCorrection);
+    const float refLevel = ref.referenceLevelDb(), afterLevel = after.referenceLevelDb();
+    const auto targetMid  = matchCurve (ref.mid,  refLevel, after.mid,  afterLevel, maxDynamicDb);
+    const auto targetSide = matchCurve (ref.side, refLevel, after.side, afterLevel, maxDynamicDb);
+
+    const float up = boostDbPerSec * (float) seconds, down = cutDbPerSec * (float) seconds;
+    const float longStep = 1.0f - (float) std::exp (-seconds / longSeconds);
+
+    const auto follow = [&] (float& value, float target, float averagePower, float currentPower, float& longDb)
+    {
+        const float average = toDb (averagePower);
+        if (! longTermValid)
+            longDb = average;
+
+        if (std::abs (toDb (currentPower) - average) > holdDb || average < longDb - absentDb)
+            return;   // hold
+
+        value  += juce::jlimit (-down, up, target - value);
+        longDb += longStep * (average - longDb);
+    };
+
+    for (size_t b = 0; b < (size_t) numBands; ++b)
+    {
+        follow (dynamicMid[b],  targetMid[b],  live.mid[b],  fastMid[b],  longMid[b]);
+        follow (dynamicSide[b], targetSide[b], live.side[b], fastSide[b], longSide[b]);
+    }
+    longTermValid = true;
+}
+
+// Linear-phase 2x2 filter matrix from the correction curves:
+//   HL, HR: left/right gain with half of the phase difference each,
+//   M, S:   mid/side gain  ->  a = (M+S)/2 HL, b = (M-S)/2 HR, c = (M-S)/2 HL, d = (M+S)/2 HR
+// Each response -> inverse FFT -> centred, windowed impulse response -> partition spectra
+void MatchEngine::designFilters (const Correction& c, MatrixConvolver::Filters& f)
 {
     const int n = firLength;
-    std::fill (designData.begin(), designData.end(), 0.0f);
+    for (auto& d : designData)
+        std::fill (d.begin(), d.end(), 0.0f);
 
     for (int k = 0; k <= n / 2; ++k)
     {
-        const auto hz = (float) ((double) k * sampleRate / n);
-        designData[(size_t) k * 2] = juce::Decibels::decibelsToGain (Spectrum::interpolate (gainDb, Spectrum::bandOfFrequency (hz)));
+        const float band = bandOfFrequency ((float) ((double) k * sampleRate / n));
+        const bool  real = k == 0 || k == n / 2;   // DC and Nyquist must stay real
+        const float half = real ? 0.0f : 0.5f * interpolate (c.phase, band);
+
+        const auto hl = std::polar (juce::Decibels::decibelsToGain (interpolate (c.left,  band)),  half);
+        const auto hr = std::polar (juce::Decibels::decibelsToGain (interpolate (c.right, band)), -half);
+        const float m = juce::Decibels::decibelsToGain (interpolate (c.mid,  band));
+        const float s = juce::Decibels::decibelsToGain (interpolate (c.side, band));
+        const float p = 0.5f * (m + s), q = 0.5f * (m - s);
+
+        const std::complex<float> values[] { p * hl, q * hr, q * hl, p * hr };
+        for (size_t i = 0; i < 4; ++i)
+        {
+            designData[i][(size_t) k * 2]     = values[i].real();
+            designData[i][(size_t) k * 2 + 1] = values[i].imag();
+        }
     }
 
-    designFft->performRealOnlyInverseTransform (designData.data());
-
-    for (int i = 0; i < n; ++i)
-        designIr[(size_t) i] = designData[(size_t) ((i + n / 2) % n)] * designWindow[(size_t) i];
-
-    PartitionedConvolver::makeSpectra (designIr.data(), n, blockSize, *partitionFft, partitionScratch, spectra);
+    std::vector<float>* targets[] { &f.a, &f.b, &f.c, &f.d };
+    for (size_t i = 0; i < 4; ++i)
+    {
+        designFft->performRealOnlyInverseTransform (designData[i].data());
+        for (int j = 0; j < n; ++j)
+            designIr[(size_t) j] = designData[i][(size_t) ((j + n / 2) % n)] * designWindow[(size_t) j];
+        MatrixConvolver::makeSpectra (designIr.data(), n, blockSize, *partitionFft, partitionScratch, *targets[i]);
+    }
 }

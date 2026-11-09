@@ -4,7 +4,8 @@
 namespace
 {
     const juce::Identifier fileProperty ("referenceFile"), startProperty ("rangeStart"),
-                           endProperty ("rangeEnd"), profileProperty ("referenceProfile");
+                           endProperty ("rangeEnd"), profileProperty ("referenceProfile"),
+                           learnedProperty ("learnedProfile");
 
     // Reference profile <-> text (stored with the project, so no new analysis is needed)
     juce::String profileToString (const Spectrum::Profile& p)
@@ -13,7 +14,7 @@ namespace
             return {};
 
         juce::MemoryOutputStream out;
-        for (const auto* curve : { &p.left, &p.right, &p.mid, &p.side, &p.correlation })
+        for (const auto* curve : { &p.left, &p.right, &p.mid, &p.side, &p.crossRe, &p.crossIm })
             out.write (curve->data(), sizeof (Spectrum::Curve));
         return out.getMemoryBlock().toBase64Encoding();
     }
@@ -22,16 +23,16 @@ namespace
     {
         Spectrum::Profile p;
         juce::MemoryBlock block;
-        if (block.fromBase64Encoding (text) && block.getSize() == 5 * sizeof (Spectrum::Curve))
+        if (! block.fromBase64Encoding (text) || block.getSize() != 6 * sizeof (Spectrum::Curve))
+            return p;
+
+        auto* src = static_cast<const char*> (block.getData());
+        for (auto* curve : { &p.left, &p.right, &p.mid, &p.side, &p.crossRe, &p.crossIm })
         {
-            auto* src = static_cast<const char*> (block.getData());
-            for (auto* curve : { &p.left, &p.right, &p.mid, &p.side, &p.correlation })
-            {
-                std::memcpy (curve->data(), src, sizeof (Spectrum::Curve));
-                src += sizeof (Spectrum::Curve);
-            }
-            p.valid = true;
+            std::memcpy (curve->data(), src, sizeof (Spectrum::Curve));
+            src += sizeof (Spectrum::Curve);
         }
+        p.valid = true;
         return p;
     }
 }
@@ -197,6 +198,7 @@ void UlMaToProcessor::getStateInformation (juce::MemoryBlock& destData)
 {
     auto state = apvts.copyState();
     state.setProperty (profileProperty, profileToString (getReferenceProfile()), nullptr);
+    state.setProperty (learnedProperty, profileToString (engine.getLearned()), nullptr);
 
     if (auto xml = state.createXml())
         copyXmlToBinary (*xml, destData);
@@ -209,11 +211,15 @@ void UlMaToProcessor::setStateInformation (const void* data, int sizeInBytes)
         {
             auto state = juce::ValueTree::fromXml (*xml);
             const auto profile = profileFromString (state.getProperty (profileProperty).toString());
+            const auto learned = profileFromString (state.getProperty (learnedProperty).toString());
             state.removeProperty (profileProperty, nullptr);
+            state.removeProperty (learnedProperty, nullptr);
             apvts.replaceState (state);
 
             if (profile.valid)
                 setReferenceProfile (profile);
+            if (learned.valid)
+                engine.setLearned (learned);
         }
 }
 

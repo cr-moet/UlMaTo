@@ -21,6 +21,14 @@ UlMaToEditor::UlMaToEditor (UlMaToProcessor& p)
     statusLabel.setFont (juce::Font (juce::FontOptions (12.0f)));
     addAndMakeVisible (statusLabel);
 
+    learnButton.setClickingTogglesState (true);
+    learnButton.setToggleState (processor.isLearning(), juce::dontSendNotification);
+    learnButton.onClick = [this] { processor.setLearning (learnButton.getToggleState()); };
+    addAndMakeVisible (learnButton);
+    addAndMakeVisible (learnLed);
+    learnLabel.setFont (juce::Font (juce::FontOptions (12.0f, juce::Font::bold)));
+    addAndMakeVisible (learnLabel);
+
     for (auto* view : std::initializer_list<juce::Component*> { &stereoView, &midSideView, &phaseView, &liveView })
         addAndMakeVisible (view);
 
@@ -62,17 +70,28 @@ void UlMaToEditor::timerCallback()
         statusLabel.setText ("Analysing ... " + juce::String (juce::roundToInt (processor.getAnalysisProgress() * 100.0f)) + " %",
                              juce::dontSendNotification);
 
-    if (const int version = processor.getReferenceVersion(); version != shownReferenceVersion)
+    // LEARN: button text and LED
+    const bool learning = learnButton.getToggleState();
+    const auto learned  = processor.getLearnedProfile();
+    learnButton.setButtonText (learning ? "STOP LEARNING" : "LEARN INPUT");
+    learnLed.setState (learning ? Led::State::blinking : learned.valid ? Led::State::on : Led::State::off);
+    learnLabel.setText (learning ? "LEARNING INPUT ..." : learned.valid ? "INPUT ANALYSED" : "INPUT NOT ANALYSED",
+                        juce::dontSendNotification);
+
+    const int refVersion = processor.getReferenceVersion(), learnedVersion = processor.getLearnedVersion();
+    if (refVersion != shownReferenceVersion || learnedVersion != shownLearnedVersion)
     {
-        shownReferenceVersion = version;
         const auto profile = processor.getReferenceProfile();
         for (auto* view : { &stereoView, &midSideView, &phaseView })
-            view->setProfile (profile);
+            view->setProfiles (profile, learned);
         liveView.setReference (profile);
 
-        if (! busy)
+        if (! busy && refVersion != shownReferenceVersion)
             statusLabel.setText (profile.valid ? "Reference analysed" : "Drop a reference song above",
                                  juce::dontSendNotification);
+
+        shownReferenceVersion = refVersion;
+        shownLearnedVersion   = learnedVersion;
     }
 }
 
@@ -108,6 +127,10 @@ void UlMaToEditor::resized()
     auto controls = area.removeFromTop (32);
     analyseButton.setBounds (controls.removeFromLeft (140));
     controls.removeFromLeft (14);
+    learnLabel.setBounds (controls.removeFromRight (150));
+    learnLed.setBounds (controls.removeFromRight (24));
+    controls.removeFromRight (6);
+    learnButton.setBounds (controls.removeFromRight (150));
     statusLabel.setBounds (controls);
     area.removeFromTop (12);
 

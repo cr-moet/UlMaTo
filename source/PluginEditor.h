@@ -26,6 +26,11 @@ private:
     juce::TextButton analyseButton { "ANALYZE" };
     juce::Label statusLabel;
 
+    // LEARN: analyse the plugin input (click = start, click again = stop)
+    juce::TextButton learnButton { "LEARN INPUT" };
+    Led learnLed;
+    juce::Label learnLabel;
+
     ProfileView stereoView  { ProfileView::Kind::stereo,  "STEREO  (L / R)  [dBFS]" },
                 midSideView { ProfileView::Kind::midSide, "MID / SIDE  [dBFS]" },
                 phaseView   { ProfileView::Kind::phase,   "PHASE CORRELATION" };
@@ -37,7 +42,7 @@ private:
     juce::AudioProcessorValueTreeState::SliderAttachment matchAttachment    { processor.apvts, ParamIDs::amount,   matchKnob },
                                                          responseAttachment { processor.apvts, ParamIDs::response, responseKnob };
 
-    int shownReferenceVersion = -1;
+    int shownReferenceVersion = -1, shownLearnedVersion = -1;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (UlMaToEditor)
 };

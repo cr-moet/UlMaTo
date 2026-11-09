@@ -1,26 +1,32 @@
 #pragma once
 
 #include "Spectrum.h"
-#include "PartitionedConvolver.h"
+#include "MatrixConvolver.h"
+#include <complex>
 
 //==============================================================================
-// Live analysis and the linear-phase mid/side match EQ.
+// Matching engine: static + dynamic linear-phase correction towards the reference.
 //
-// Audio thread  - process(): hands input and output to the engine thread and applies
-//                 the current EQ (partitioned convolution, mid and side).
-// Engine thread - tracks the long-term spectrum of the input, compares it with the
-//                 reference and designs new FIR filters every 100 ms. New filters are
-//                 handed over without locks and cross-faded without clicks.
+// Static part  - from a learned profile of the input (LEARN) to the reference:
+//                EQ of left and right, phase between the channels, EQ of mid and side.
+// Dynamic part - follows the music: compares the current input (as it sounds after
+//                the static part) with the reference and corrects mid and side.
+//                Bands that drop out or return are held until the analysis has caught
+//                up, boosts change slowly and cuts quickly, so returning bass does not
+//                pump or overshoot.
+// Both are combined into one 2x2 filter matrix (one convolution stage). The audio
+// runs 10 ms behind the analysis (lookahead).
 //
-// Matching mid and side separately also matches the stereo width and the phase
-// correlation per band, which follow from the side/mid ratio.
+// Audio thread  - process(): hands input/output to the engine thread, applies the filters.
+// Engine thread - analysis, learning, correction and filter design (about every 40 ms);
+//                 new filters are handed over without locks and cross-faded.
 //==============================================================================
 class MatchEngine final : private juce::Thread
 {
 public:
-    static constexpr float  maxCorrectionDb = 12.0f;   // limit per band
-    static constexpr int    blockSize       = 512;     // internal processing block
-    static constexpr double updateSeconds   = 0.1;     // filter update interval
+    static constexpr int    blockSize      = 512;     // internal processing block
+    static constexpr double lookaheadMs    = 10.0;
+    static constexpr double updateSeconds  = 0.04;    // filter update interval
 
     MatchEngine();
     ~MatchEngine() override;
@@ -29,18 +35,29 @@ public:
     void prepare (double sampleRate, int maxBlockSize);
     void release();
 
-    // Internal block + linear-phase filters (half their length)
-    int getLatencySamples() const noexcept   { return blockSize + firLength / 2; }
+    // Lookahead + internal block + linear-phase filters (half their length)
+    int getLatencySamples() const noexcept   { return lookahead + blockSize + firLength / 2; }
 
     // Audio thread. amount = 0 ... 1 (0 = no correction, signal only delayed),
     // response = time constant of the live analysis in seconds
     void process (juce::AudioBuffer<float>& buffer, float amount, float response) noexcept;
 
-    // Reference profile (from the analysis of the reference song); any thread except audio
+    // Profiles (any thread except audio)
     void setReference (const Spectrum::Profile& reference);
+    void setLearned (const Spectrum::Profile& learned);
+    Spectrum::Profile getLearned() const;
+    Spectrum::Profile getOutputProfile() const;   // processed signal, for the display
 
-    // For the display: spectrum of the processed signal
-    Spectrum::Profile getOutputProfile() const;
+    // LEARN: start / stop the analysis of the input (the result follows a moment later)
+    void setLearning (bool shouldLearn) noexcept   { learnRequest = shouldLearn; }
+    bool isLearning() const noexcept               { return learning.load(); }
+    int getLearnedVersion() const noexcept         { return learnedVersion.load(); }
+
+    // Correction curves (dB / radians per band)
+    struct Correction
+    {
+        Spectrum::Curve left {}, right {}, phase {}, mid {}, side {};
+    };
 
 private:
     //==========================================================================
@@ -56,48 +73,55 @@ private:
 
         void reset();
         void push (const float* l, const float* r, int numSamples) noexcept;   // audio thread
-        void read (double decay);                                              // engine thread
-    };
-
-    // Filter spectra for mid and side; two slots: one in use by the audio thread,
-    // the other filled by the engine thread
-    struct FilterSet
-    {
-        std::vector<float> mid, side;
+        void read (double decay, double fastDecay, Spectrum::Analyser* alsoTo = nullptr);   // engine thread
     };
 
     void run() override;
-    void updateFilters();
-    void designFilter (const Spectrum::Curve& gainDb, std::vector<float>& spectra);
+    void updateLearning();
+    void updateFilters (double seconds);
+    void updateDynamic (const Spectrum::Profile& ref, const Spectrum::Profile& live,
+                        const Spectrum::Curve& fastMid, const Spectrum::Curve& fastSide, double seconds);
+    void designFilters (const Correction& c, MatrixConvolver::Filters& filters);
 
     double sampleRate = 48000.0;
-    int firLength = 4096;
+    int firLength = 4096, lookahead = 480;
 
     std::atomic<float> currentAmount { 0.0f }, currentResponse { 1.0f };
     Tap input, output;
 
-    // Engine thread: filter design
+    // Learning (engine thread)
+    Spectrum::Analyser learnAnalyser;
+    std::atomic<bool> learnRequest { false }, learning { false };
+    std::atomic<int> learnedVersion { 0 };
+
+    // Correction state (engine thread)
+    Correction staticCorrection, applied;
+    Spectrum::Curve dynamicMid {}, dynamicSide {}, longMid {}, longSide {};   // dB
+    bool firstFilters = true, longTermValid = false;
+    std::atomic<bool> profilesChanged { true };
+
+    // Filter design (engine thread)
     std::unique_ptr<juce::dsp::FFT> designFft, partitionFft;
-    std::vector<float> designData, designWindow, designIr, partitionScratch;
-    Spectrum::Curve appliedMid {}, appliedSide {};
-    bool filtersValid = false;
-    std::atomic<bool> referenceChanged { false };
+    std::array<std::vector<float>, 4> designData;
+    std::vector<float> designWindow, designIr, partitionScratch;
 
-    // Hand-over: the engine writes slot [1 - active] while newFilter is false,
-    // the audio thread switches (cross-fade) and clears newFilter
-    std::array<FilterSet, 2> filters;
-    std::atomic<int> activeFilter { 0 };
-    std::atomic<bool> newFilter { false };
+    // Hand-over: the engine fills slot [1 - active] while newFilters is false,
+    // the audio thread switches (cross-fade) and clears newFilters
+    std::array<MatrixConvolver::Filters, 2> filters;
+    std::atomic<int> activeFilters { 0 };
+    std::atomic<bool> newFilters { false };
 
-    // Audio thread: block buffering and convolution
-    PartitionedConvolver midConvolver, sideConvolver;
-    std::vector<float> midBlock, sideBlock, midOut, sideOut;
+    // Audio thread: lookahead delay, block buffering, convolution
+    MatrixConvolver convolver;
+    juce::AudioBuffer<float> delayLine;
+    int delayPosition = 0;
+    std::vector<float> blockL, blockR, outL, outR;
     int blockPosition = 0;
     bool prepared = false;
 
     // Shared with the GUI / message thread
     mutable juce::CriticalSection stateLock;
-    Spectrum::Profile reference, outputProfile;
+    Spectrum::Profile reference, learned, outputProfile;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (MatchEngine)
 };
