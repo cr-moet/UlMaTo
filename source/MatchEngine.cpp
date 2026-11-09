@@ -9,14 +9,21 @@ namespace
     constexpr float maxBalanceDb   = 3.0f;     // left/right: only the balance, gently
     constexpr float maxSideBoostDb = 6.0f;     // side may be raised this much at most (above 400 Hz)
     constexpr float maxDynamicDb   = 9.0f;
-    constexpr float maxDynamicSide = 4.0f;     // side: boosts (cuts may go to maxDynamicDb)
     constexpr float maxPhase       = juce::MathConstants<float>::pi / 4.0f;
-    constexpr float boostDbPerSec  = 4.0f;     // dynamic part: gain may rise slowly ...
-    constexpr float cutDbPerSec    = 24.0f;    // ... and fall quickly
-    constexpr float sideUpPerSec   = 2.0f;     // side moves slower (the image must not wander)
-    constexpr float sideDownPerSec = 6.0f;
     constexpr float holdDb         = 6.0f;     // current level this far from the average: hold
     constexpr float absentDb       = 10.0f;    // average this far below the long-term level: hold
+
+    // Dynamic part, bass -> treble (blended between 300 Hz and 3 kHz): the bass moves slowly
+    // and calmly (no pumping, no wandering image), the treble follows the music quickly
+    struct Speed { float low, high; float at (float s) const { return low + s * (high - low); } };
+    constexpr Speed fastShare      { 0.0f, 1.0f };     // share of the current (0.15 s) level in the target
+    constexpr Speed glideSeconds   { 0.5f, 0.1f };     // exponential glide towards the target
+    constexpr Speed midUpPerSec    { 4.0f, 30.0f };    // ... but never faster than this (dB/s)
+    constexpr Speed midDownPerSec  { 24.0f, 40.0f };
+    constexpr Speed sideUpPerSec   { 2.0f, 20.0f };
+    constexpr Speed sideDownPerSec { 6.0f, 30.0f };
+    constexpr Speed maxSideBoost   { 4.0f, 9.0f };     // dynamic side boost (cuts: maxDynamicDb)
+    constexpr Speed holdExtraDb    { 0.0f, 30.0f };    // the treble is hardly ever held
     constexpr double fastSeconds   = 0.15;     // time constant of the current level
     constexpr double longSeconds   = 10.0;     // time constant of the long-term level
 
@@ -446,43 +453,60 @@ void MatchEngine::updateFilters (double seconds)
 }
 
 // Dynamic part: compares the input as it sounds after the static part with the reference.
-// A band is held (its correction stays as it is)
+// Per band, from bass to treble: the target uses more of the current level instead of the
+// average, glides there faster and may move faster. In the bass a band is held (its
+// correction stays as it is)
 //  - while its current level differs from its average by more than holdDb: it drops out
 //    (e.g. a bass pause) or comes back and the average has not caught up yet,
 //  - while its average is more than absentDb below its long-term level: it is missing
 //    in this part of the song, however long that lasts.
-// So a missing band is never boosted, and nothing overshoots when it returns.
+// So a missing bass is never boosted and does not overshoot when it returns, while the
+// treble follows changes of tone and width without lagging behind.
 void MatchEngine::updateDynamic (const Spectrum::Profile& ref, const Spectrum::Profile& live,
                                  const Spectrum::Curve& fastMid, const Spectrum::Curve& fastSide, double seconds)
 {
-    const auto after = applyCorrection (live, staticCorrection);
+    auto after = applyCorrection (live, staticCorrection);
     const float refLevel = ref.referenceLevelDb(), afterLevel = after.referenceLevelDb();
+
+    // Blend in the current level (as a power ratio on top of the static correction)
+    for (size_t b = 0; b < (size_t) numBands; ++b)
+    {
+        const float share = fastShare.at (fade (b, 300.0f, 3000.0f));
+        const auto blend = [share] (float average, float current)
+        {
+            return average > 1.0e-30f && current > 1.0e-30f ? std::pow (current / average, share) : 1.0f;
+        };
+        after.mid[b]  *= blend (live.mid[b],  fastMid[b]);
+        after.side[b] *= blend (live.side[b], fastSide[b]);
+    }
+
     const auto targetMid  = matchCurve (ref.mid,  refLevel, after.mid,  afterLevel, maxDynamicDb);
-    auto targetSide = matchCurve (ref.side, refLevel, after.side, afterLevel, maxDynamicDb);
-    for (auto& v : targetSide)
-        v = juce::jmin (v, maxDynamicSide);
+    const auto targetSide = matchCurve (ref.side, refLevel, after.side, afterLevel, maxDynamicDb);
+    const float dt = (float) seconds;
+    const float longStep = 1.0f - std::exp (-dt / (float) longSeconds);
 
-    const float up = boostDbPerSec * (float) seconds, down = cutDbPerSec * (float) seconds;
-    const float sideUp = sideUpPerSec * (float) seconds, sideDown = sideDownPerSec * (float) seconds;
-    const float longStep = 1.0f - (float) std::exp (-seconds / longSeconds);
-
-    const auto follow = [&] (float& value, float target, float averagePower, float currentPower, float& longDb, float rise, float fall)
+    const auto follow = [&] (float& value, float target, float averagePower, float currentPower, float& longDb,
+                             float speed, Speed up, Speed down)
     {
         const float average = toDb (averagePower);
         if (! longTermValid)
             longDb = average;
 
-        if (std::abs (toDb (currentPower) - average) > holdDb || average < longDb - absentDb)
+        const float extra = holdExtraDb.at (speed);
+        if (std::abs (toDb (currentPower) - average) > holdDb + extra || average < longDb - absentDb - extra)
             return;   // hold
 
-        value  += juce::jlimit (-fall, rise, target - value);
+        const float glide = 1.0f - std::exp (-dt / glideSeconds.at (speed));
+        value  += juce::jlimit (-down.at (speed) * dt, up.at (speed) * dt, glide * (target - value));
         longDb += longStep * (average - longDb);
     };
 
     for (size_t b = 0; b < (size_t) numBands; ++b)
     {
-        follow (dynamicMid[b],  targetMid[b],  live.mid[b],  fastMid[b],  longMid[b],  up, down);
-        follow (dynamicSide[b], targetSide[b], live.side[b], fastSide[b], longSide[b], sideUp, sideDown);
+        const float speed = fade (b, 300.0f, 3000.0f);
+        follow (dynamicMid[b], targetMid[b], live.mid[b], fastMid[b], longMid[b], speed, midUpPerSec, midDownPerSec);
+        follow (dynamicSide[b], juce::jmin (targetSide[b], maxSideBoost.at (speed)),
+                live.side[b], fastSide[b], longSide[b], speed, sideUpPerSec, sideDownPerSec);
     }
     longTermValid = true;
 }
