@@ -12,6 +12,10 @@
 //      transformer output stage: saturates mostly in the bass, like a real core.
 // The saturation is stereo: the drive of each saturator is varied by a random value per
 // sample, separately for left and right.
+// Only the harmonics are added: from each saturated signal its share of the input (the
+// fundamental, projected over a short window) is taken out again and the rest is added to
+// the unchanged input. Automatic gain staging then keeps the overall level of the
+// saturation section equal to its input (slowly, so it does not pump).
 // All amounts 0: the input, delayed by the latency, unchanged (cross-faded over 20 ms).
 //==============================================================================
 namespace Analog
@@ -39,7 +43,7 @@ namespace Analog
             oversampling.initProcessing ((size_t) maxBlockSize);
             splitter.prepare (sampleRate * 2.0, true);
 
-            transportDelay = juce::jmax (8, juce::roundToInt (sampleRate * 0.001));   // 1 ms around which wow/flutter move
+            transportDelay = juce::jmax (16, juce::roundToInt (sampleRate * 0.005));   // 5 ms around which wow/flutter move
             latency = transportDelay + juce::roundToInt (oversampling.getLatencyInSamples());
             transport.setSize (2, juce::nextPowerOfTwo (transportDelay * 2 + 8));
             dry.setSize (2, latency + 1);
@@ -48,6 +52,15 @@ namespace Analog
             fadeStep = 1.0f / (float) (sampleRate * 0.02);
             dcCoefficient = 1.0f - std::exp (-juce::MathConstants<float>::twoPi * 5.0f / (float) (sampleRate * 2.0));
             coreCoefficient = 1.0f - std::exp (-juce::MathConstants<float>::twoPi * 120.0f / (float) (sampleRate * 2.0));
+
+            // Windows for the fundamental: longer in the bass (several periods)
+            const auto window = [this] (float seconds) { return 1.0f - std::exp (-1.0f / (float) (sampleRate * 2.0 * seconds)); };
+            static constexpr float bandSeconds[Dynamics::numBands] { 0.06f, 0.02f, 0.01f, 0.005f, 0.003f };
+            for (size_t b = 0; b < (size_t) Dynamics::numBands; ++b)
+                bandCoefficient[b] = window (bandSeconds[b]);
+            stageCoefficient  = window (0.04f);
+            levelCoefficient  = window (0.3f);
+            makeUpCoefficient = window (0.5f);
             crackleHighpass = std::exp (-juce::MathConstants<float>::twoPi * 900.0f / (float) sampleRate);
             reset();
         }
@@ -66,7 +79,12 @@ namespace Analog
             crackleDecay = 0.0f;
             crackleState = { 0.0f, 0.0f };
             crackleLast = { 0.0f, 0.0f };
-            dcIn = dcOut = core = { 0.0f, 0.0f };
+            dcIn = dcOut = core = powerIn = powerOut = { 0.0f, 0.0f };
+            makeUp = { 1.0f, 1.0f };
+            for (auto& channel : tapeHarmonics)
+                channel.fill ({});
+            tubeHarmonics.fill ({});
+            transformerHarmonics.fill ({});
             fade = 0.0f;
         }
 
@@ -144,8 +162,8 @@ namespace Analog
             tl[transportPosition] = l;
             tr[transportPosition] = r;
 
-            // Delay in samples: wow up to 0.25 % pitch at ~0.5 Hz with a slow random drift,
-            // flutter up to 0.12 % at ~7 Hz plus 11 Hz and a little noise
+            // Delay in samples: wow up to 1.5 % pitch at ~0.5 Hz with a slow random drift,
+            // flutter up to 0.5 % at ~7 Hz plus 11 Hz and a little noise
             const double twoPi = juce::MathConstants<double>::twoPi;
             wowPhase      = std::fmod (wowPhase + twoPi * 0.55 / sampleRate, twoPi);
             flutterPhase  = std::fmod (flutterPhase + twoPi * 7.1 / sampleRate, twoPi);
@@ -158,9 +176,9 @@ namespace Analog
             drift += (driftTarget - drift) * (float) (2.0 / sampleRate);
             flutterNoise += (random() - flutterNoise) * (float) (60.0 / sampleRate);
 
-            const float wowDepth = (float) (0.0025 * sampleRate / (twoPi * 0.55)), flutterDepth = (float) (0.0012 * sampleRate / (twoPi * 7.1));
+            const float wowDepth = (float) (0.015 * sampleRate / (twoPi * 0.55)), flutterDepth = (float) (0.005 * sampleRate / (twoPi * 7.1));
             const float modulation = s.wow * wowDepth * (0.75f * (float) std::sin (wowPhase) + 0.25f * drift)
-                                   + s.flutter * flutterDepth * ((float) std::sin (flutterPhase) + 0.4f * (float) std::sin (flutterPhase2) + 3.0f * flutterNoise);
+                                   + s.flutter * flutterDepth * (0.7f * (float) std::sin (flutterPhase) + 0.3f * (float) std::sin (flutterPhase2) + flutterNoise);
             const float delay = (float) transportDelay + juce::jlimit (-(float) transportDelay + 2.0f, (float) transportDelay - 2.0f, modulation);
 
             // Cubic (Hermite) interpolation
@@ -202,18 +220,38 @@ namespace Analog
             }
         }
 
-        // Tape per band, tube, transformer (oversampled)
+        // Harmonics of one saturator: its output minus its share of the input (the fundamental,
+        // projected with exponential averages of x*y and x*x over a short window)
+        struct Harmonics
+        {
+            float xy = 0.0f, xx = 0.0f;
+
+            float operator() (float x, float saturated, float coefficient) noexcept
+            {
+                xy += coefficient * (x * saturated - xy);
+                xx += coefficient * (x * x - xx);
+                const float share = xx > 1.0e-12f ? xy / xx : 1.0f;
+                return saturated - share * x;
+            }
+        };
+
+        // Tape per band, tube, transformer (oversampled); each adds only its harmonics
         void saturate (float* l, float* r, int numSamples, const Settings& s) noexcept
         {
+            // Full scale of the knobs: SUB 1/10, LOW MID 1/2 of the other bands
+            static constexpr float tapeScale[Dynamics::numBands] { 0.1f, 0.5f, 1.0f, 1.0f, 1.0f };
             Dynamics::Values tapeDrive {}, tapeSpread {};
             bool tapeOn = false;
             for (size_t b = 0; b < (size_t) Dynamics::numBands; ++b)
             {
-                tapeDrive[b]  = juce::Decibels::decibelsToGain (s.tape[b] * 12.0f);   // up to +12 dB into the tape
-                tapeSpread[b] = 0.06f * s.tape[b];                                   // random L/R drive variation
+                const float amount = s.tape[b] * tapeScale[b];
+                tapeDrive[b]  = juce::Decibels::decibelsToGain (amount * 12.0f);   // up to +12 dB into the tape
+                tapeSpread[b] = 0.06f * amount;                                   // random L/R drive variation
                 tapeOn = tapeOn || s.tape[b] > 0.0f;
             }
-            const float tubeDrive = 1.0f + 3.0f * s.tube, transformerDrive = 1.0f + 5.0f * s.transformer;
+            const float tubeAmount = 0.024f * s.tube, transformerAmount = 0.024f * s.transformer;
+            const float tubeDrive = 1.0f + 3.0f * tubeAmount, transformerDrive = 1.0f + 5.0f * transformerAmount;
+            const bool any = tapeOn || s.tube > 0.0f || s.transformer > 0.0f;
 
             // Warm tape curve: asymmetric (a little bias), unity gain for small signals
             constexpr float bias = 0.15f;
@@ -231,43 +269,49 @@ namespace Analog
             Dynamics::Values bl, br;
             for (int i = 0; i < numSamples; ++i)
             {
-                float x[] { l[i], r[i] };
+                const float in[] { l[i], r[i] };
+                float x[] { in[0], in[1] };
 
                 if (tapeOn)
                 {
                     splitter.process (x[0], x[1], bl, br);
-                    x[0] = x[1] = 0.0f;
-                    for (size_t b = 0; b < (size_t) Dynamics::numBands; ++b)
-                    {
-                        if (s.tape[b] <= 0.0f)
-                        {
-                            x[0] += bl[b];
-                            x[1] += br[b];
-                            continue;
-                        }
-                        x[0] += tape (bl[b], tapeDrive[b] * (1.0f + tapeSpread[b] * random()));
-                        x[1] += tape (br[b], tapeDrive[b] * (1.0f + tapeSpread[b] * random()));
-                    }
+                    Dynamics::Values* bands[] { &bl, &br };
+                    for (size_t c = 0; c < 2; ++c)
+                        for (size_t b = 0; b < (size_t) Dynamics::numBands; ++b)
+                            if (s.tape[b] > 0.0f)
+                            {
+                                const float band = (*bands[c])[b];
+                                x[c] += tapeHarmonics[c][b] (band, tape (band, tapeDrive[b] * (1.0f + tapeSpread[b] * random())),
+                                                            bandCoefficient[b]);
+                            }
                 }
 
                 for (size_t c = 0; c < 2; ++c)
                 {
                     float y = x[c];
                     if (s.tube > 0.0f)
-                        y = tube (y, tubeDrive * (1.0f + 0.05f * s.tube * random()));
+                        y += tubeHarmonics[c] (y, tube (y, tubeDrive * (1.0f + 0.05f * tubeAmount * random())), stageCoefficient);
 
                     if (s.transformer > 0.0f)
                     {
                         // The core saturates with the low frequencies (flux), the rest passes
                         core[c] += coreCoefficient * (y - core[c]);
-                        const float drive = transformerDrive * (1.0f + 0.05f * s.transformer * random());
-                        y += std::tanh (drive * core[c]) / drive - core[c];
+                        const float drive = transformerDrive * (1.0f + 0.05f * transformerAmount * random());
+                        y += transformerHarmonics[c] (core[c], std::tanh (drive * core[c]) / drive, stageCoefficient);
                     }
 
                     // DC blocker (asymmetric curves)
                     dcOut[c] = y - dcIn[c] + (1.0f - dcCoefficient) * dcOut[c];
                     dcIn[c] = y;
-                    io[c][i] = dcOut[c];
+                    y = dcOut[c];
+
+                    // Gain staging: the level of the section follows its input (slowly, +-3 dB)
+                    powerIn[c]  += levelCoefficient * (in[c] * in[c] - powerIn[c]);
+                    powerOut[c] += levelCoefficient * (y * y - powerOut[c]);
+                    const float target = any && powerOut[c] > 1.0e-10f
+                                             ? juce::jlimit (0.7f, 1.4f, std::sqrt (powerIn[c] / powerOut[c])) : 1.0f;
+                    makeUp[c] += makeUpCoefficient * (target - makeUp[c]);
+                    io[c][i] = y * makeUp[c];
                 }
             }
         }
@@ -281,8 +325,12 @@ namespace Analog
         double wowPhase = 0.0, flutterPhase = 0.0, flutterPhase2 = 0.0;
         float drift = 0.0f, driftTarget = 0.0f, flutterNoise = 0.0f;
 
-        std::array<float, 2> crackleEnv {}, crackleState {}, crackleLast {}, dcIn {}, dcOut {}, core {};
+        std::array<float, 2> crackleEnv {}, crackleState {}, crackleLast {}, dcIn {}, dcOut {}, core {}, powerIn {}, powerOut {}, makeUp {};
         float crackleDecay = 0.0f, crackleHighpass = 0.0f, dcCoefficient = 0.0f, coreCoefficient = 0.0f;
+        std::array<std::array<Harmonics, Dynamics::numBands>, 2> tapeHarmonics;
+        std::array<Harmonics, 2> tubeHarmonics, transformerHarmonics;
+        Dynamics::Values bandCoefficient {};
+        float stageCoefficient = 0.0f, levelCoefficient = 0.0f, makeUpCoefficient = 0.0f;
         float fade = 0.0f, fadeStep = 0.0f;
         uint32_t seed = 0x9e3779b9u;
     };
