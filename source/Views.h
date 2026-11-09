@@ -627,22 +627,23 @@ private:
 };
 
 //==============================================================================
-// Tabs of the stages in processing order (left = first, arrows = signal flow).
-// A click selects the page, dragging a tab moves the stage to where it is dropped.
-// The LED on each tab: lit = stage active, a click on it bypasses the stage.
+// Tabs of the stages in processing order (left = first, arrows = signal flow), drawn
+// as hardware buttons: the selected one is pressed in, the LED shows whether the stage
+// is active (a click on the LED bypasses it). Click: select the page. Drag: the tab
+// follows the mouse, the others slide aside, on release it snaps into its place.
 //==============================================================================
-class StageTabs final : public juce::Component
+class StageTabs final : public juce::Component,
+                        private juce::Timer
 {
 public:
     using Order = MatchEngine::Order;
+    using Bypassed = std::array<bool, MatchEngine::numStages>;
 
     StageTabs()   { setMouseCursor (juce::MouseCursor::PointingHandCursor); }
 
     std::function<void (int)>          onSelect;        // page = stage
     std::function<void (const Order&)> onOrderChange;
     std::function<void (int)>          onBypassToggle;  // stage
-
-    using Bypassed = std::array<bool, MatchEngine::numStages>;
 
     void setState (int page, const Order& newOrder, const Bypassed& newBypassed)
     {
@@ -651,55 +652,55 @@ public:
             selected = page;
             order = newOrder;
             bypassed = newBypassed;
-            repaint();
+            animate();
         }
+    }
+
+    void resized() override
+    {
+        for (int slot = 0; slot < numSlots; ++slot)   // no animation when the size changes
+            position[(size_t) order[(size_t) slot]] = slotX (slot);
+        repaint();
     }
 
     void paint (juce::Graphics& g) override
     {
-        for (int slot = 0; slot < numSlots; ++slot)
+        // Arrows between the slots
+        for (int slot = 0; slot < numSlots - 1; ++slot)
         {
-            if (order[(size_t) slot] != dragged)
-                drawTab (g, order[(size_t) slot], slotBounds (slot));
-
-            if (slot < numSlots - 1)   // arrow to the next stage
-            {
-                const auto a = slotBounds (slot).getRight() + arrowGap * 0.5f, y = (float) getHeight() * 0.5f;
-                juce::Path arrow;
-                arrow.addTriangle (a - 5.0f, y - 6.0f, a - 5.0f, y + 6.0f, a + 6.0f, y);
-                g.setColour (Colours::text);
-                g.fillPath (arrow);
-            }
+            const auto a = slotX (slot) + tabWidth() + arrowGap * 0.5f, y = (float) getHeight() * 0.5f - 1.0f;
+            juce::Path arrow;
+            arrow.addTriangle (a - 5.0f, y - 6.0f, a - 5.0f, y + 6.0f, a + 6.0f, y);
+            g.setColour (Colours::text);
+            g.fillPath (arrow);
         }
 
-        // Hint, if there is room for it
-        const auto rest = getLocalBounds().toFloat().withTrimmedLeft (slotBounds (numSlots - 1).getRight() + 16.0f);
-        if (rest.getWidth() > 220.0f)
-        {
-            g.setColour (Colours::text.withAlpha (0.55f));
-            g.setFont (juce::Font (juce::FontOptions (11.0f)));
-            g.drawText ("SIGNAL FLOW  -  drag a tab to change the order", rest, juce::Justification::centredLeft);
-        }
-
-        if (dragged >= 0)   // the dragged tab on top, where the mouse is
-            drawTab (g, dragged, slotBounds (0).withX (juce::jlimit (0.0f, slotBounds (numSlots - 1).getX(), dragX)));
+        for (int page : order)
+            if (page != dragged)
+                drawTab (g, page, tabAt (position[(size_t) page]));
+        if (dragged >= 0)   // on top, where the mouse is
+            drawTab (g, dragged, tabAt (position[(size_t) dragged]).translated (0.0f, -2.0f));
     }
 
     void mouseDown (const juce::MouseEvent& e) override
     {
         pressed = -1;
         for (int slot = 0; slot < numSlots; ++slot)
-            if (slotBounds (slot).contains (e.position))
+        {
+            const auto tab = tabAt (slotX (slot));
+            if (! tab.contains (e.position))
+                continue;
+
+            const int page = order[(size_t) slot];
+            if (ledArea (tab).contains (e.position))
             {
-                if (ledBounds (slotBounds (slot)).expanded (4.0f).contains (e.position))
-                {
-                    if (onBypassToggle != nullptr)
-                        onBypassToggle (order[(size_t) slot]);
-                    return;
-                }
-                pressed = order[(size_t) slot];
-                grabOffset = e.position.x - slotBounds (slot).getX();
+                if (onBypassToggle != nullptr)
+                    onBypassToggle (page);
+                return;
             }
+            pressed = page;
+            grabOffset = e.position.x - tab.getX();
+        }
     }
 
     void mouseDrag (const juce::MouseEvent& e) override
@@ -707,35 +708,25 @@ public:
         if (pressed < 0 || (dragged < 0 && e.getDistanceFromDragStartX() * e.getDistanceFromDragStartX() < 25))
             return;
         dragged = pressed;
-        dragX = e.position.x - grabOffset;
+        position[(size_t) dragged] = juce::jlimit (0.0f, slotX (numSlots - 1), e.position.x - grabOffset);
         setMouseCursor (juce::MouseCursor::DraggingHandCursor);
-        repaint();
+        animate();
     }
 
     void mouseUp (const juce::MouseEvent&) override
     {
         if (dragged >= 0)
         {
-            // The slot nearest to where the tab was dropped
-            const int target = juce::jlimit (0, numSlots - 1, juce::roundToInt (dragX / (tabWidth() + arrowGap)));
-            Order newOrder;
-            int n = 0;
-            for (int slot = 0; slot < numSlots; ++slot)   // the others keep their order around it
-            {
-                if (slot == target)
-                    newOrder[(size_t) slot] = dragged;
-                else
-                {
-                    while (order[(size_t) n] == dragged)
-                        ++n;
-                    newOrder[(size_t) slot] = order[(size_t) n++];
-                }
-            }
-            if (newOrder != order && onOrderChange != nullptr)
-                onOrderChange (newOrder);
+            const auto newOrder = orderWhileDragging();
             dragged = -1;
             setMouseCursor (juce::MouseCursor::PointingHandCursor);
-            repaint();
+            if (newOrder != order)
+            {
+                order = newOrder;
+                if (onOrderChange != nullptr)
+                    onOrderChange (newOrder);
+            }
+            animate();   // snaps into its slot
         }
         else if (pressed >= 0 && onSelect != nullptr)
             onSelect (pressed);
@@ -746,59 +737,90 @@ private:
     static constexpr int numSlots = MatchEngine::numStages;
     static constexpr float arrowGap = 22.0f;
 
-    // As wide as possible, at most 170 px
-    float tabWidth() const   { return juce::jmin (170.0f, ((float) getWidth() - (numSlots - 1) * arrowGap) / (float) numSlots); }
+    float tabWidth() const              { return juce::jmin (170.0f, ((float) getWidth() - (numSlots - 1) * arrowGap) / (float) numSlots); }
+    float slotX (int slot) const        { return (float) slot * (tabWidth() + arrowGap); }
+    juce::Rectangle<float> tabAt (float x) const   { return { x, 0.0f, tabWidth(), (float) getHeight() }; }
 
-    juce::Rectangle<float> slotBounds (int slot) const
+    // LED window at the top of the face (and the area that reacts to clicks on it)
+    static juce::Rectangle<float> ledWindow (juce::Rectangle<float> tab, bool down)
     {
-        return { (float) slot * (tabWidth() + arrowGap), 0.0f, tabWidth(), (float) getHeight() };
+        const auto face = UlMaToLookAndFeel::buttonFaceArea (tab, down);
+        return juce::Rectangle<float> (16.0f, 4.0f).withCentre ({ face.getCentreX(), face.getY() + 6.0f });
+    }
+    static juce::Rectangle<float> ledArea (juce::Rectangle<float> tab)   { return ledWindow (tab, false).expanded (14.0f, 6.0f); }
+
+    // Order while a tab is dragged: it goes to the slot nearest to where it is now
+    Order orderWhileDragging() const
+    {
+        if (dragged < 0)
+            return order;
+        const int target = juce::jlimit (0, numSlots - 1, juce::roundToInt (position[(size_t) dragged] / (tabWidth() + arrowGap)));
+        Order result {};
+        int n = 0;
+        for (int slot = 0; slot < numSlots; ++slot)
+        {
+            if (slot == target)
+                result[(size_t) slot] = dragged;
+            else
+            {
+                while (order[(size_t) n] == dragged)
+                    ++n;
+                result[(size_t) slot] = order[(size_t) n++];
+            }
+        }
+        return result;
     }
 
-    static juce::Rectangle<float> ledBounds (juce::Rectangle<float> tab)
+    void animate()   { if (! isTimerRunning()) startTimerHz (60); repaint(); }
+
+    // Every tab glides towards its slot (the dragged one stays at the mouse)
+    void timerCallback() override
     {
-        return juce::Rectangle<float> (12.0f, 12.0f).withCentre ({ tab.getRight() - 15.0f, tab.getCentreY() - 1.5f });
+        const auto target = orderWhileDragging();
+        bool moving = dragged >= 0;
+        for (int slot = 0; slot < numSlots; ++slot)
+        {
+            const int page = target[(size_t) slot];
+            if (page == dragged)
+                continue;
+            auto& x = position[(size_t) page];
+            const float goal = slotX (slot);
+            x += 0.3f * (goal - x);
+            if (std::abs (goal - x) < 0.5f)
+                x = goal;
+            else
+                moving = true;
+        }
+        repaint();
+        if (! moving)
+            stopTimer();
     }
 
     void drawTab (juce::Graphics& g, int page, juce::Rectangle<float> r) const
     {
-        const bool on = page == selected;
-        r = r.reduced (0.5f);
-        g.setColour (Colours::text.withAlpha (0.35f));   // shadow edge, as the buttons
-        g.fillRoundedRectangle (r, 3.0f);
-        g.setColour (on ? Colours::text : Colours::panel);
-        g.fillRoundedRectangle (r.withTrimmedBottom (3.0f), 3.0f);
-        g.setColour (Colours::text.withAlpha (0.5f));
-        g.drawRoundedRectangle (r, 3.0f, 1.0f);
+        const bool down = page == selected, off = bypassed[(size_t) page];
+        UlMaToLookAndFeel::drawHardwareButton (g, r, UlMaToLookAndFeel::buttonFace(), false, down);
+        UlMaToLookAndFeel::drawLed (g, ledWindow (r, down), ! off);
+
+        auto face = UlMaToLookAndFeel::buttonFaceArea (r, down);
+        face.removeFromTop (9.0f);
 
         // Grip: the tab can be moved
-        const auto fg = on ? Colours::background : Colours::text;
-        g.setColour (fg.withAlpha (0.5f));
+        g.setColour (Colours::text.withAlpha (0.35f));
         for (int i = 0; i < 3; ++i)
-            g.fillRect (r.getX() + 10.0f + (float) i * 3.0f, r.getCentreY() - 7.0f, 1.2f, 12.0f);
+            g.fillRect (face.getX() + 8.0f + (float) i * 3.0f, face.getCentreY() - 5.0f, 1.2f, 10.0f);
 
-        // Bypassed: faded name; LED: lit = active
-        const bool off = bypassed[(size_t) page];
         static constexpr const char* names[] { "EQ MATCH", "DYNAMICS", "ANALOG HEAT", "PHASEQ", "GRAPHIC EQ", "LIMITER" };
-        g.setColour (fg.withAlpha (off ? 0.4f : 1.0f));
+        g.setColour ((down ? Colours::accent : Colours::text).withAlpha (off ? 0.4f : 1.0f));
         g.setFont (juce::Font (juce::FontOptions (13.0f, juce::Font::bold)));
-        g.drawText (names[page], r.withTrimmedLeft (18.0f).withTrimmedRight (22.0f).withTrimmedBottom (3.0f), juce::Justification::centred);
-
-        const auto led = ledBounds (r);
-        g.setColour (Colours::text);
-        g.fillEllipse (led);
-        g.setColour (off ? Colours::text.brighter (0.35f) : Colours::accent);
-        g.fillEllipse (led.reduced (2.0f));
-        if (! off)
-        {
-            g.setColour (juce::Colours::white.withAlpha (0.45f));
-            g.fillEllipse (led.reduced (4.0f).translated (-1.0f, -1.0f));
-        }
+        g.drawText (names[page], face.withTrimmedLeft (16.0f), juce::Justification::centred);
     }
 
     Order order = MatchEngine::defaultOrder();
     Bypassed bypassed {};
+    std::array<float, MatchEngine::numStages> position {};   // current x of each page's tab
     int selected = 0, pressed = -1, dragged = -1;
-    float dragX = 0.0f, grabOffset = 0.0f;
+    float grabOffset = 0.0f;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (StageTabs)
 };
@@ -826,17 +848,8 @@ public:
 
     void paint (juce::Graphics& g) override
     {
-        const auto r = getLocalBounds().toFloat().withSizeKeepingCentre (14.0f, 14.0f);
         const bool lit = state == State::on || (state == State::blinking && blinkOn);
-        g.setColour (Colours::text);
-        g.fillEllipse (r);
-        g.setColour (lit ? Colours::accent : Colours::text.brighter (0.3f));
-        g.fillEllipse (r.reduced (2.5f));
-        if (lit)
-        {
-            g.setColour (juce::Colours::white.withAlpha (0.45f));
-            g.fillEllipse (r.reduced (5.0f).translated (-1.0f, -1.0f));
-        }
+        UlMaToLookAndFeel::drawLed (g, getLocalBounds().toFloat().withSizeKeepingCentre (16.0f, 5.0f), lit);
     }
 
 private:

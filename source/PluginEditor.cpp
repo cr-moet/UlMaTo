@@ -12,8 +12,7 @@ UlMaToEditor::UlMaToEditor (UlMaToProcessor& p)
     setLookAndFeel (&lookAndFeel);
 
     bypassButton.setClickingTogglesState (true);
-    bypassButton.setColour (juce::TextButton::buttonOnColourId, Colours::accent);
-    bypassButton.setColour (juce::TextButton::textColourOnId, Colours::background);
+    bypassButton.getProperties().set ("led", true);
     addAndMakeVisible (bypassButton);
 
     // Tabs: click = page, drag = order of the stages
@@ -36,8 +35,7 @@ UlMaToEditor::UlMaToEditor (UlMaToProcessor& p)
     addAndMakeVisible (waveform);
     waveform.onFileChanged = [this] { statusLabel.setText ("Select a range and press ANALYZE", juce::dontSendNotification); };
 
-    analyseButton.setColour (juce::TextButton::buttonColourId, Colours::accent);
-    analyseButton.setColour (juce::TextButton::textColourOffId, Colours::background);
+    analyseButton.setColour (juce::TextButton::textColourOffId, Colours::accent);
     analyseButton.onClick = [this] { processor.analyseReference(); };
     addAndMakeVisible (analyseButton);
 
@@ -45,6 +43,7 @@ UlMaToEditor::UlMaToEditor (UlMaToProcessor& p)
     addAndMakeVisible (statusLabel);
 
     learnButton.setClickingTogglesState (true);
+    learnButton.getProperties().set ("led", true);
     learnButton.setToggleState (processor.isLearning(), juce::dontSendNotification);
     learnButton.onClick = [this] { processor.setLearning (learnButton.getToggleState()); };
     addAndMakeVisible (learnButton);
@@ -88,7 +87,7 @@ UlMaToEditor::UlMaToEditor (UlMaToProcessor& p)
     // Analog heat page
     const auto setUpKnobOn = [this] (int page, LabelledKnob& k, const char* id, const juce::String& text)
     {
-        k.knob.setTextBoxStyle (juce::Slider::TextBoxBelow, false, 70, 20);
+        k.knob.setTextBoxStyle (juce::Slider::TextBoxBelow, false, 96, 20);
         k.knob.setColour (juce::Slider::textBoxBackgroundColourId, Colours::text);
         k.knob.setColour (juce::Slider::textBoxTextColourId, Colours::accent);
         k.attachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (processor.apvts, id, k.knob);
@@ -135,8 +134,7 @@ UlMaToEditor::UlMaToEditor (UlMaToProcessor& p)
     for (auto* b : { &limiterOnButton, &truePeakButton })
     {
         b->setClickingTogglesState (true);
-        b->setColour (juce::TextButton::buttonOnColourId, Colours::accent);
-        b->setColour (juce::TextButton::textColourOnId, Colours::background);
+        b->getProperties().set ("led", true);
         addChildComponent (b);
     }
     pages[MatchEngine::limiterStage].insert (pages[MatchEngine::limiterStage].end(), { &limiterView, &limiterOnButton, &truePeakButton });
@@ -148,6 +146,7 @@ UlMaToEditor::UlMaToEditor (UlMaToProcessor& p)
     setResizeLimits (900, 700, 2400, 1600);
     setSize (1100, 840);
     showPage ((int) processor.apvts.state.getProperty (pageProperty, 0));
+    sendLookAndFeelChange();   // the value boxes of the knobs were created before the look was set
 
     timerCallback();
     startTimerHz (10);
@@ -261,7 +260,7 @@ void UlMaToEditor::paint (juce::Graphics& g)
 
 void UlMaToEditor::resized()
 {
-    bypassButton.setBounds (getWidth() - 14 - 110, 12, 110, 30);
+    bypassButton.setBounds (getWidth() - 14 - 110, 8, 110, 38);
 
     auto area = getLocalBounds().reduced (14, 0);
     area.removeFromTop (headerHeight + 14);
@@ -270,7 +269,7 @@ void UlMaToEditor::resized()
     // Reference song
     waveform.setBounds (area.removeFromTop (150));
     area.removeFromTop (8);
-    auto controls = area.removeFromTop (32);
+    auto controls = area.removeFromTop (38);
     analyseButton.setBounds (controls.removeFromLeft (140));
     controls.removeFromLeft (14);
     learnLabel.setBounds (controls.removeFromRight (150));
@@ -281,7 +280,7 @@ void UlMaToEditor::resized()
     area.removeFromTop (12);
 
     // Tabs
-    tabs.setBounds (area.removeFromTop (28));
+    tabs.setBounds (area.removeFromTop (36));
     tabLine = area.removeFromTop (2);
     area.removeFromTop (12);
 
@@ -334,10 +333,10 @@ void UlMaToEditor::resized()
         page.removeFromBottom (12);
         limiterView.setBounds (page);
 
-        auto buttons = knobRow.removeFromRight (180).withSizeKeepingCentre (160, 80);
-        limiterOnButton.setBounds (buttons.removeFromTop (34));
-        buttons.removeFromTop (12);
-        truePeakButton.setBounds (buttons.removeFromTop (34));
+        auto buttons = knobRow.removeFromRight (180).withSizeKeepingCentre (160, 90);
+        limiterOnButton.setBounds (buttons.removeFromTop (40));
+        buttons.removeFromTop (10);
+        truePeakButton.setBounds (buttons.removeFromTop (40));
 
         const int w = knobRow.getWidth() / (int) limiterKnobs.size();
         for (auto& k : limiterKnobs)
