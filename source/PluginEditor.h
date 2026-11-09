@@ -26,14 +26,16 @@ private:
     juce::TextButton analyseButton { "ANALYZE" };
     juce::Label statusLabel;
 
-    ProfileView stereoView  { ProfileView::Kind::stereo,  "STEREO  (L / R)" },
-                midSideView { ProfileView::Kind::midSide, "MID / SIDE" },
+    ProfileView stereoView  { ProfileView::Kind::stereo,  "STEREO  (L / R)  [dBFS]" },
+                midSideView { ProfileView::Kind::midSide, "MID / SIDE  [dBFS]" },
                 phaseView   { ProfileView::Kind::phase,   "PHASE CORRELATION" };
     LiveView liveView { processor };
 
-    juce::Slider matchKnob { juce::Slider::RotaryHorizontalVerticalDrag, juce::Slider::TextBoxBelow };
-    juce::Label matchLabel;
-    juce::AudioProcessorValueTreeState::SliderAttachment matchAttachment { processor.apvts, ParamIDs::amount, matchKnob };
+    juce::Slider matchKnob    { juce::Slider::RotaryHorizontalVerticalDrag, juce::Slider::TextBoxBelow },
+                 responseKnob { juce::Slider::RotaryHorizontalVerticalDrag, juce::Slider::TextBoxBelow };
+    juce::Label matchLabel, responseLabel;
+    juce::AudioProcessorValueTreeState::SliderAttachment matchAttachment    { processor.apvts, ParamIDs::amount,   matchKnob },
+                                                         responseAttachment { processor.apvts, ParamIDs::response, responseKnob };
 
     int shownReferenceVersion = -1;
 

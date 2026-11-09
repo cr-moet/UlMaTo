@@ -56,7 +56,7 @@ namespace Spectrum
     };
 
     //==========================================================================
-    // Short-time FFT analyser (8192 points, Hann window). Frames are added one by one;
+    // Short-time FFT analyser (8192 points, Hann window, 75 % overlap). Frames are added one by one;
     // with decay = 1 all frames count equally (reference song), with decay < 1 older
     // frames fade out exponentially (live signal).
     class Analyser final
@@ -64,7 +64,7 @@ namespace Spectrum
     public:
         static constexpr int order = 13;
         static constexpr int size  = 1 << order;   // samples per frame
-        static constexpr int hop   = size / 2;     // 50 % overlap
+        static constexpr int hop   = size / 4;     // 75 % overlap: a new frame every 43 ms (48 kHz)
 
         Analyser()
         {

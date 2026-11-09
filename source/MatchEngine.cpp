@@ -54,6 +54,56 @@ namespace
 }
 
 //==============================================================================
+void MatchEngine::Tap::reset()
+{
+    fifo.reset();
+    frame.clear();
+    newSamples = 0;
+    analyser.reset();
+}
+
+void MatchEngine::Tap::push (const float* l, const float* r, int numSamples) noexcept
+{
+    const auto scope = fifo.write (numSamples);   // if the engine lags behind, the rest is dropped
+    for (int ch = 0; ch < 2; ++ch)
+    {
+        const float* src = ch == 0 ? l : r;
+        if (scope.blockSize1 > 0) fifoBuffer.copyFrom (ch, scope.startIndex1, src, scope.blockSize1);
+        if (scope.blockSize2 > 0) fifoBuffer.copyFrom (ch, scope.startIndex2, src + scope.blockSize1, scope.blockSize2);
+    }
+}
+
+void MatchEngine::Tap::read (double decay)
+{
+    constexpr int size = Spectrum::Analyser::size, hop = Spectrum::Analyser::hop;
+
+    for (int ready = fifo.getNumReady(); ready > 0; ready = fifo.getNumReady())
+    {
+        const int count = juce::jmin (ready, hop - newSamples);
+        const auto scope = fifo.read (count);
+
+        for (int ch = 0; ch < 2; ++ch)
+        {
+            float* dest = frame.getWritePointer (ch, size - hop + newSamples);
+            if (scope.blockSize1 > 0) juce::FloatVectorOperations::copy (dest, fifoBuffer.getReadPointer (ch, scope.startIndex1), scope.blockSize1);
+            if (scope.blockSize2 > 0) juce::FloatVectorOperations::copy (dest + scope.blockSize1, fifoBuffer.getReadPointer (ch, scope.startIndex2), scope.blockSize2);
+        }
+
+        if ((newSamples += count) < hop)
+            continue;
+
+        // Full frame. Silence (pauses, stopped transport) is skipped, so the analysis
+        // and the correction stay as they are.
+        if (frame.getRMSLevel (0, 0, size) + frame.getRMSLevel (1, 0, size) > 1.0e-4f)
+            analyser.addFrame (frame.getReadPointer (0), frame.getReadPointer (1), decay);
+
+        for (int ch = 0; ch < 2; ++ch)   // keep the newest samples for the next frame (regions overlap: memmove)
+            std::memmove (frame.getWritePointer (ch), frame.getReadPointer (ch, hop), sizeof (float) * (size_t) (size - hop));
+        newSamples = 0;
+    }
+}
+
+//==============================================================================
 MatchEngine::MatchEngine() : juce::Thread ("UlMaTo match engine") {}
 
 MatchEngine::~MatchEngine()
@@ -61,7 +111,7 @@ MatchEngine::~MatchEngine()
     stopThread (4000);
 }
 
-void MatchEngine::prepare (double newSampleRate, int maxBlockSize)
+void MatchEngine::prepare (double newSampleRate, int)
 {
     stopThread (4000);
 
@@ -69,42 +119,35 @@ void MatchEngine::prepare (double newSampleRate, int maxBlockSize)
 
     // Filter length: about 85 ms (frequency resolution ~12 Hz), power of two
     firLength = juce::nextPowerOfTwo ((int) (sampleRate * 0.085));
-    designFft = std::make_unique<juce::dsp::FFT> (juce::roundToInt (std::log2 (firLength)));
+    designFft    = std::make_unique<juce::dsp::FFT> (juce::roundToInt (std::log2 (firLength)));
+    partitionFft = std::make_unique<juce::dsp::FFT> (juce::roundToInt (std::log2 (2 * blockSize)));
     designData.assign ((size_t) firLength * 2, 0.0f);
+    designIr.assign ((size_t) firLength, 0.0f);
     designWindow.resize ((size_t) firLength);
     juce::dsp::WindowingFunction<float>::fillWindowingTables (designWindow.data(), (size_t) firLength,
                                                               juce::dsp::WindowingFunction<float>::blackman, false);
 
-    midBuffer.setSize (1, maxBlockSize);
-    sideBuffer.setSize (1, maxBlockSize);
+    for (auto* c : { &midConvolver, &sideConvolver })
+        c->prepare (blockSize, firLength);
 
-    const juce::dsp::ProcessSpec spec { sampleRate, (juce::uint32) maxBlockSize, 1 };
-    midFilter.prepare (spec);
-    sideFilter.prepare (spec);
-
-    // Start with a neutral filter (pure delay), so the latency is right from the start
-    Spectrum::Curve flat {};
-    for (auto* filter : { &midFilter, &sideFilter })
+    // Both slots start with a neutral filter (pure delay)
+    const Spectrum::Curve flat {};
+    for (auto& set : filters)
     {
-        juce::AudioBuffer<float> ir;
-        designFilter (flat, ir);
-        filter->loadImpulseResponse (std::move (ir), sampleRate, juce::dsp::Convolution::Stereo::no,
-                                     juce::dsp::Convolution::Trim::no, juce::dsp::Convolution::Normalise::no);
+        designFilter (flat, set.mid);
+        set.side = set.mid;
     }
-    midFilter.reset();
-    sideFilter.reset();
+    activeFilter = 0;
+    newFilter = false;
 
-    fifo.reset();
-    analyser.reset();
-    frame.clear();
-    newSamples = 0;
-    frameDecay = std::exp (-(double) Spectrum::Analyser::hop / (sampleRate * trackingSeconds));
+    for (auto* v : { &midBlock, &sideBlock, &midOut, &sideOut })
+        v->assign ((size_t) blockSize, 0.0f);
+    blockPosition = 0;
+
+    input.reset();
+    output.reset();
     appliedMid = appliedSide = flat;
-    filtersValid = false;
-    {
-        const juce::SpinLock::ScopedLockType lock (pendingLock);
-        pendingReady = false;
-    }
+    filtersValid = true;
 
     prepared = true;
     startThread (juce::Thread::Priority::low);
@@ -125,64 +168,60 @@ void MatchEngine::setReference (const Spectrum::Profile& newReference)
     referenceChanged = true;
 }
 
-MatchEngine::State MatchEngine::getState() const
+Spectrum::Profile MatchEngine::getOutputProfile() const
 {
     const juce::ScopedLock lock (stateLock);
-    return state;
+    return outputProfile;
 }
 
 //==============================================================================
-void MatchEngine::process (juce::AudioBuffer<float>& buffer, float amount) noexcept
+void MatchEngine::process (juce::AudioBuffer<float>& buffer, float amount, float response) noexcept
 {
     const int numSamples = buffer.getNumSamples();
     if (! prepared || numSamples == 0 || buffer.getNumChannels() == 0)
         return;
 
     currentAmount.store (amount, std::memory_order_relaxed);
-
-    // New filters from the engine thread (try-lock: never wait on the audio thread)
-    {
-        const juce::SpinLock::ScopedTryLockType lock (pendingLock);
-        if (lock.isLocked() && pendingReady)
-        {
-            using C = juce::dsp::Convolution;
-            midFilter.loadImpulseResponse  (std::move (pendingMid),  sampleRate, C::Stereo::no, C::Trim::no, C::Normalise::no);
-            sideFilter.loadImpulseResponse (std::move (pendingSide), sampleRate, C::Stereo::no, C::Trim::no, C::Normalise::no);
-            pendingReady = false;
-        }
-    }
+    currentResponse.store (response, std::memory_order_relaxed);
 
     float* left  = buffer.getWritePointer (0);
-    float* right = buffer.getNumChannels() > 1 ? buffer.getWritePointer (1) : nullptr;
-    const float* rightIn = right != nullptr ? right : left;
+    float* right = buffer.getNumChannels() > 1 ? buffer.getWritePointer (1) : left;
 
-    // Input -> engine thread (if the thread lags behind, the rest is dropped)
+    input.push (left, right, numSamples);
+
+    // Mid / side in internal blocks of 'blockSize' samples (output one block later)
+    for (int i = 0; i < numSamples; ++i)
     {
-        const auto scope = fifo.write (numSamples);
-        for (int ch = 0; ch < 2; ++ch)
+        const auto pos = (size_t) blockPosition;
+        midBlock[pos]  = 0.5f * (left[i] + right[i]);
+        sideBlock[pos] = 0.5f * (left[i] - right[i]);
+        left[i]  = midOut[pos] + sideOut[pos];
+        right[i] = midOut[pos] - sideOut[pos];   // mono: left == right == mid
+
+        if (++blockPosition < blockSize)
+            continue;
+
+        blockPosition = 0;
+
+        // New filter from the engine thread: cross-fade within this block
+        const int active = activeFilter.load (std::memory_order_relaxed);
+        const bool change = newFilter.load (std::memory_order_acquire);
+        const auto& current = filters[(size_t) active];
+        const auto* next = change ? &filters[(size_t) (1 - active)] : nullptr;
+
+        midConvolver.process  (midBlock.data(),  current.mid.data(),  next != nullptr ? next->mid.data()  : nullptr);
+        sideConvolver.process (sideBlock.data(), current.side.data(), next != nullptr ? next->side.data() : nullptr);
+        std::swap (midBlock, midOut);
+        std::swap (sideBlock, sideOut);
+
+        if (change)
         {
-            const float* src = ch == 0 ? left : rightIn;
-            if (scope.blockSize1 > 0) fifoBuffer.copyFrom (ch, scope.startIndex1, src, scope.blockSize1);
-            if (scope.blockSize2 > 0) fifoBuffer.copyFrom (ch, scope.startIndex2, src + scope.blockSize1, scope.blockSize2);
+            activeFilter.store (1 - active, std::memory_order_relaxed);
+            newFilter.store (false, std::memory_order_release);
         }
     }
 
-    // Mid / side, filter, back to left / right
-    float* mid  = midBuffer.getWritePointer (0);
-    float* side = sideBuffer.getWritePointer (0);
-    juce::FloatVectorOperations::add      (mid,  left, rightIn, numSamples);
-    juce::FloatVectorOperations::subtract (side, left, rightIn, numSamples);
-    juce::FloatVectorOperations::multiply (mid,  0.5f, numSamples);
-    juce::FloatVectorOperations::multiply (side, 0.5f, numSamples);
-
-    auto midBlock  = juce::dsp::AudioBlock<float> (midBuffer).getSubBlock (0, (size_t) numSamples);
-    auto sideBlock = juce::dsp::AudioBlock<float> (sideBuffer).getSubBlock (0, (size_t) numSamples);
-    midFilter.process  (juce::dsp::ProcessContextReplacing<float> (midBlock));
-    sideFilter.process (juce::dsp::ProcessContextReplacing<float> (sideBlock));
-
-    juce::FloatVectorOperations::add (left, mid, side, numSamples);
-    if (right != nullptr)
-        juce::FloatVectorOperations::subtract (right, mid, side, numSamples);
+    output.push (left, right, numSamples);
 
     for (int ch = 2; ch < buffer.getNumChannels(); ++ch)
         buffer.clear (ch, 0, numSamples);
@@ -196,9 +235,13 @@ void MatchEngine::run()
 
     while (! threadShouldExit())
     {
-        readInput();
+        // Exponential averaging per frame with the selected time constant
+        const double frameSeconds = Spectrum::Analyser::hop / sampleRate;
+        const double decay = std::exp (-frameSeconds / juce::jmax (0.05, (double) currentResponse.load()));
+        input.read (decay);
+        output.read (decay);
 
-        const auto now    = juce::Time::getMillisecondCounterHiRes();
+        const auto now = juce::Time::getMillisecondCounterHiRes();
         const float amount = currentAmount.load (std::memory_order_relaxed);
 
         if (now - lastUpdate >= updateSeconds * 1000.0 || std::abs (amount - lastAmount) > 0.002f
@@ -209,40 +252,7 @@ void MatchEngine::run()
             lastAmount = amount;
         }
 
-        wait (20);
-    }
-}
-
-// Collects the input into overlapping frames and adds them to the live analysis
-void MatchEngine::readInput()
-{
-    constexpr int size = Spectrum::Analyser::size, hop = Spectrum::Analyser::hop;
-
-    for (int ready = fifo.getNumReady(); ready > 0; ready = fifo.getNumReady())
-    {
-        const int count = juce::jmin (ready, hop - newSamples);
-        const auto scope = fifo.read (count);
-
-        for (int ch = 0; ch < 2; ++ch)
-        {
-            float* dest = frame.getWritePointer (ch, size - hop + newSamples);
-            if (scope.blockSize1 > 0) juce::FloatVectorOperations::copy (dest, fifoBuffer.getReadPointer (ch, scope.startIndex1), scope.blockSize1);
-            if (scope.blockSize2 > 0) juce::FloatVectorOperations::copy (dest + scope.blockSize1, fifoBuffer.getReadPointer (ch, scope.startIndex2), scope.blockSize2);
-        }
-        newSamples += count;
-
-        if (newSamples < hop)
-            continue;
-
-        // Full frame. Silence (pauses, stopped transport) is skipped, so the analysis
-        // and the correction stay as they are.
-        const float level = frame.getRMSLevel (0, 0, size) + frame.getRMSLevel (1, 0, size);
-        if (level > 1.0e-4f)
-            analyser.addFrame (frame.getReadPointer (0), frame.getReadPointer (1), frameDecay);
-
-        for (int ch = 0; ch < 2; ++ch)   // keep the second half for the next (overlapping) frame
-            juce::FloatVectorOperations::copy (frame.getWritePointer (ch), frame.getReadPointer (ch, hop), size - hop);
-        newSamples = 0;
+        wait (10);
     }
 }
 
@@ -254,7 +264,7 @@ void MatchEngine::updateFilters()
         ref = reference;
     }
 
-    const auto live = analyser.hasData() ? analyser.getProfile (sampleRate) : Spectrum::Profile {};
+    const auto live = input.analyser.hasData() ? input.analyser.getProfile (sampleRate) : Spectrum::Profile {};
 
     Spectrum::Curve mid {}, side {};
     if (ref.valid && live.valid)
@@ -267,32 +277,28 @@ void MatchEngine::updateFilters()
         side[b] *= amount;
     }
 
-    // New filters only when the curves have changed audibly
-    if (! filtersValid || maxDifference (mid, appliedMid) > 0.05f || maxDifference (side, appliedSide) > 0.05f)
+    // New filters only when the curves have changed and the audio thread has taken
+    // the previous ones (otherwise the next update tries again)
+    if ((maxDifference (mid, appliedMid) > 0.02f || maxDifference (side, appliedSide) > 0.02f)
+        && ! newFilter.load (std::memory_order_acquire))
     {
-        juce::AudioBuffer<float> irMid, irSide;
-        designFilter (mid, irMid);
-        designFilter (side, irSide);
-        {
-            const juce::SpinLock::ScopedLockType lock (pendingLock);
-            pendingMid   = std::move (irMid);
-            pendingSide  = std::move (irSide);
-            pendingReady = true;
-        }
-        appliedMid   = mid;
-        appliedSide  = side;
-        filtersValid = true;
+        auto& set = filters[(size_t) (1 - activeFilter.load (std::memory_order_relaxed))];
+        designFilter (mid, set.mid);
+        designFilter (side, set.side);
+        newFilter.store (true, std::memory_order_release);
+        appliedMid  = mid;
+        appliedSide = side;
     }
 
+    const auto out = output.analyser.hasData() ? output.analyser.getProfile (sampleRate) : Spectrum::Profile {};
     const juce::ScopedLock lock (stateLock);
-    state.live = live;
-    state.mid  = appliedMid;
-    state.side = appliedSide;
+    outputProfile = out;
 }
 
 // Linear-phase FIR filter with the given magnitude response (dB per band):
-// symmetric spectrum -> inverse FFT -> zero-phase impulse response, centred and windowed
-void MatchEngine::designFilter (const Spectrum::Curve& gainDb, juce::AudioBuffer<float>& ir)
+// symmetric spectrum -> inverse FFT -> zero-phase impulse response, centred and
+// windowed -> partition spectra for the convolution
+void MatchEngine::designFilter (const Spectrum::Curve& gainDb, std::vector<float>& spectra)
 {
     const int n = firLength;
     std::fill (designData.begin(), designData.end(), 0.0f);
@@ -305,8 +311,8 @@ void MatchEngine::designFilter (const Spectrum::Curve& gainDb, juce::AudioBuffer
 
     designFft->performRealOnlyInverseTransform (designData.data());
 
-    ir.setSize (1, n);
-    auto* out = ir.getWritePointer (0);
     for (int i = 0; i < n; ++i)
-        out[i] = designData[(size_t) ((i + n / 2) % n)] * designWindow[(size_t) i];
+        designIr[(size_t) i] = designData[(size_t) ((i + n / 2) % n)] * designWindow[(size_t) i];
+
+    PartitionedConvolver::makeSpectra (designIr.data(), n, blockSize, *partitionFft, partitionScratch, spectra);
 }

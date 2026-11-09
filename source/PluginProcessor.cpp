@@ -44,7 +44,8 @@ UlMaToProcessor::UlMaToProcessor()
       apvts (*this, nullptr, "UlMaTo", createParameterLayout())
 {
     formatManager.registerBasicFormats();
-    amountParam = apvts.getRawParameterValue (ParamIDs::amount);
+    amountParam   = apvts.getRawParameterValue (ParamIDs::amount);
+    responseParam = apvts.getRawParameterValue (ParamIDs::response);
 }
 
 UlMaToProcessor::~UlMaToProcessor()
@@ -55,11 +56,19 @@ UlMaToProcessor::~UlMaToProcessor()
 
 juce::AudioProcessorValueTreeState::ParameterLayout UlMaToProcessor::createParameterLayout()
 {
+    // Response: time constant of the live analysis (short = follows the music quickly)
+    juce::NormalisableRange<float> responseRange (0.2f, 5.0f, 0.01f);
+    responseRange.setSkewForCentre (1.0f);
+
     return { std::make_unique<juce::AudioParameterFloat> (
-        juce::ParameterID { ParamIDs::amount, 1 }, "Match",
-        juce::NormalisableRange<float> (0.0f, 100.0f, 0.1f), 50.0f,
-        juce::AudioParameterFloatAttributes().withLabel ("%")
-            .withStringFromValueFunction ([] (float v, int) { return juce::String (v, 0) + " %"; })) };
+                 juce::ParameterID { ParamIDs::amount, 1 }, "Match",
+                 juce::NormalisableRange<float> (0.0f, 100.0f, 0.1f), 50.0f,
+                 juce::AudioParameterFloatAttributes().withLabel ("%")
+                     .withStringFromValueFunction ([] (float v, int) { return juce::String (v, 0) + " %"; })),
+             std::make_unique<juce::AudioParameterFloat> (
+                 juce::ParameterID { ParamIDs::response, 1 }, "Response", responseRange, 1.0f,
+                 juce::AudioParameterFloatAttributes().withLabel ("s")
+                     .withStringFromValueFunction ([] (float v, int) { return juce::String (v, v < 1.0f ? 2 : 1) + " s"; })) };
 }
 
 bool UlMaToProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
@@ -83,7 +92,7 @@ void UlMaToProcessor::releaseResources()
 void UlMaToProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer&)
 {
     juce::ScopedNoDenormals noDenormals;
-    engine.process (buffer, amountParam->load() * 0.01f);
+    engine.process (buffer, amountParam->load() * 0.01f, responseParam->load());
 }
 
 //==============================================================================
@@ -158,8 +167,8 @@ void UlMaToProcessor::analyseReference()
 
             for (auto pos = start; pos < end && ! shuttingDown.load(); pos += hop)
             {
-                for (int ch = 0; ch < 2; ++ch)   // keep the second half (50 % overlap)
-                    frame.copyFrom (ch, 0, frame, ch, hop, size - hop);
+                for (int ch = 0; ch < 2; ++ch)   // keep the newest samples (75 % overlap, regions overlap: memmove)
+                    std::memmove (frame.getWritePointer (ch), frame.getReadPointer (ch, hop), sizeof (float) * (size_t) (size - hop));
 
                 const auto count = (int) juce::jmin ((juce::int64) hop, end - pos);
                 frame.clear (size - hop, hop);

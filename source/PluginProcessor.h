@@ -6,7 +6,8 @@
 
 namespace ParamIDs
 {
-    inline constexpr const char* amount = "amount";   // match amount 0 ... 100 %
+    inline constexpr const char* amount   = "amount";     // match amount 0 ... 100 %
+    inline constexpr const char* response = "response";   // time constant of the live analysis (s)
 }
 
 //==============================================================================
@@ -66,7 +67,8 @@ public:
     Spectrum::Profile getReferenceProfile() const;
     int getReferenceVersion() const noexcept               { return referenceVersion.load(); }
 
-    MatchEngine::State getMatchState() const               { return engine.getState(); }
+    // Spectrum of the processed signal (for the display)
+    Spectrum::Profile getOutputProfile() const             { return engine.getOutputProfile(); }
 
     juce::AudioProcessorValueTreeState apvts;
 
@@ -77,6 +79,7 @@ private:
     juce::AudioFormatManager formatManager;
     MatchEngine engine;
     std::atomic<float>* amountParam = nullptr;
+    std::atomic<float>* responseParam = nullptr;
 
     mutable juce::CriticalSection referenceLock;
     Spectrum::Profile referenceProfile;

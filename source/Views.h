@@ -268,7 +268,7 @@ public:
         Plot::drawPanel (g, plot);
 
         const bool phase = kind == Kind::phase;
-        const float top = phase ? 1.0f : 12.0f, bottom = phase ? -1.0f : -48.0f;
+        const float top = phase ? 1.0f : 0.0f, bottom = phase ? -1.0f : -96.0f;
         Plot::drawGrid (g, plot, top, bottom, phase ? 0.5f : 12.0f, true);
 
         if (! profile.valid)
@@ -278,8 +278,7 @@ public:
             return;
         }
 
-        const float level = profile.referenceLevelDb();
-        const auto db = [level] (const Spectrum::Curve& c) { return [&c, level] (int b) { return Spectrum::toDb (c[(size_t) b]) - level; }; };
+        const auto db = [] (const Spectrum::Curve& c) { return [&c] (int b) { return Spectrum::toDb (c[(size_t) b]); }; };
 
         switch (kind)
         {
@@ -312,8 +311,8 @@ private:
 };
 
 //==============================================================================
-// Signal running through the plugin: live mid/side spectrum compared with the
-// reference (dashed), and below the EQ curves currently applied
+// Spectrum of the processed signal (after the MATCH knob) in dBFS; the reference is
+// drawn dashed, moved to the level of the signal so the shapes can be compared
 //==============================================================================
 class LiveView final : public juce::Component,
                        private juce::Timer
@@ -328,49 +327,37 @@ public:
         auto r = getLocalBounds().toFloat();
         g.setColour (Colours::text);
         g.setFont (juce::Font (juce::FontOptions (12.0f, juce::Font::bold)));
-        g.drawText ("LIVE SPECTRUM", r.removeFromTop (18.0f), juce::Justification::centredLeft);
+        g.drawText ("OUTPUT SPECTRUM  [dBFS]", r.removeFromTop (18.0f), juce::Justification::centredLeft);
 
-        auto area = r.withTrimmedLeft (40.0f).withTrimmedBottom (14.0f);
-        const auto eq   = area.removeFromBottom (area.getHeight() * 0.32f);
-        const auto spec = area.withTrimmedBottom (20.0f);
+        const auto plot = r.withTrimmedLeft (40.0f).withTrimmedBottom (14.0f);
+        constexpr float top = 0.0f, bottom = -96.0f;
+        Plot::drawPanel (g, plot);
+        Plot::drawGrid (g, plot, top, bottom, 12.0f, true);
 
-        // Spectra: each relative to its own average level, so the shapes can be compared
-        Plot::drawPanel (g, spec);
-        Plot::drawGrid (g, spec, 12.0f, -48.0f, 12.0f, false);
-
-        const auto& live = state.live;
-        if (reference.valid)
+        if (reference.valid && live.valid)
         {
-            const float level = reference.referenceLevelDb();
-            Plot::drawCurve (g, spec, 12.0f, -48.0f, Colours::text.withAlpha (0.55f), 1.2f, true,
-                             [&] (int b) { return Spectrum::toDb (reference.side[(size_t) b]) - level; });
-            Plot::drawCurve (g, spec, 12.0f, -48.0f, Colours::accent.withAlpha (0.6f), 1.2f, true,
-                             [&] (int b) { return Spectrum::toDb (reference.mid[(size_t) b]) - level; });
+            const float shift = live.referenceLevelDb() - reference.referenceLevelDb();
+            Plot::drawCurve (g, plot, top, bottom, Colours::text.withAlpha (0.55f), 1.2f, true,
+                             [&] (int b) { return Spectrum::toDb (reference.side[(size_t) b]) + shift; });
+            Plot::drawCurve (g, plot, top, bottom, Colours::accent.withAlpha (0.6f), 1.2f, true,
+                             [&] (int b) { return Spectrum::toDb (reference.mid[(size_t) b]) + shift; });
         }
         if (live.valid)
         {
-            const float level = live.referenceLevelDb();
-            Plot::drawCurve (g, spec, 12.0f, -48.0f, Colours::text, 1.6f, false,
-                             [&] (int b) { return Spectrum::toDb (live.side[(size_t) b]) - level; });
-            Plot::drawCurve (g, spec, 12.0f, -48.0f, Colours::accent, 1.6f, false,
-                             [&] (int b) { return Spectrum::toDb (live.mid[(size_t) b]) - level; });
+            Plot::drawCurve (g, plot, top, bottom, Colours::text, 1.6f, false,
+                             [&] (int b) { return Spectrum::toDb (live.side[(size_t) b]); });
+            Plot::drawCurve (g, plot, top, bottom, Colours::accent, 1.6f, false,
+                             [&] (int b) { return Spectrum::toDb (live.mid[(size_t) b]); });
         }
-        Plot::drawLegend (g, spec, { { "MID", Colours::accent }, { "SIDE", Colours::text },
+        Plot::drawLegend (g, plot, { { "MID", Colours::accent }, { "SIDE", Colours::text },
                                      { "   - - REFERENCE", Colours::text.withAlpha (0.6f) } });
 
         if (! live.valid || ! reference.valid)
         {
             g.setColour (Colours::text.withAlpha (0.5f));
             g.drawText (! reference.valid ? "Analyse a reference song first" : "Waiting for signal",
-                        spec, juce::Justification::centred);
+                        plot, juce::Justification::centred);
         }
-
-        // EQ curves currently applied
-        Plot::drawPanel (g, eq);
-        Plot::drawGrid (g, eq, 12.0f, -12.0f, 6.0f, true, " dB");
-        Plot::drawCurve (g, eq, 12.0f, -12.0f, Colours::text, 1.6f, false, [this] (int b) { return state.side[(size_t) b]; });
-        Plot::drawCurve (g, eq, 12.0f, -12.0f, Colours::accent, 1.6f, false, [this] (int b) { return state.mid[(size_t) b]; });
-        Plot::drawLegend (g, eq, { { "EQ MID", Colours::accent }, { "EQ SIDE", Colours::text } });
     }
 
 private:
@@ -378,14 +365,13 @@ private:
     {
         if (isShowing())
         {
-            state = processor.getMatchState();
+            live = processor.getOutputProfile();
             repaint();
         }
     }
 
     UlMaToProcessor& processor;
-    MatchEngine::State state;
-    Spectrum::Profile reference;
+    Spectrum::Profile live, reference;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (LiveView)
 };
