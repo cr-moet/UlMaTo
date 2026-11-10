@@ -343,7 +343,14 @@ class LiveView final : public juce::Component,
 public:
     explicit LiveView (UlMaToProcessor& p) : processor (p)  { startTimerHz (25); }
 
-    void setReference (const Spectrum::Profile& p)  { reference = p; repaint(); }
+    // The reference is smoothed over frequency like the live curves, so both compare
+    void setReference (const Spectrum::Profile& p)
+    {
+        reference = p;
+        if (p.valid)
+            curves (p, referenceMid, referenceSide, referenceCorrelation);
+        repaint();
+    }
 
     void paint (juce::Graphics& g) override
     {
@@ -368,20 +375,20 @@ public:
         if (reference.valid)
         {
             Plot::drawCurve (g, plot, top, bottom, Colours::text.withAlpha (0.55f), 1.2f, true,
-                             [&] (int b) { return Spectrum::toDb (reference.side[(size_t) b]); });
+                             [&] (int b) { return referenceSide[(size_t) b]; });
             Plot::drawCurve (g, plot, top, bottom, Colours::accent.withAlpha (0.6f), 1.2f, true,
-                             [&] (int b) { return Spectrum::toDb (reference.mid[(size_t) b]); });
+                             [&] (int b) { return referenceMid[(size_t) b]; });
             Plot::drawCurve (g, plot, 1.0f, -1.0f, Colours::correlation.withAlpha (0.55f), 1.2f, true,
-                             [&] (int b) { return reference.correlation ((size_t) b); });
+                             [&] (int b) { return referenceCorrelation[(size_t) b]; });
         }
         if (live.valid)
         {
             Plot::drawCurve (g, plot, top, bottom, Colours::text, 1.6f, false,
-                             [&] (int b) { return Spectrum::toDb (live.side[(size_t) b]); });
+                             [&] (int b) { return shownSide[(size_t) b]; });
             Plot::drawCurve (g, plot, top, bottom, Colours::accent, 1.6f, false,
-                             [&] (int b) { return Spectrum::toDb (live.mid[(size_t) b]); });
+                             [&] (int b) { return shownMid[(size_t) b]; });
             Plot::drawCurve (g, plot, 1.0f, -1.0f, Colours::correlation, 1.6f, false,
-                             [&] (int b) { return live.correlation ((size_t) b); });
+                             [&] (int b) { return shownCorrelation[(size_t) b]; });
         }
         Plot::drawLegend (g, plot, { { "MID", Colours::accent }, { "SIDE", Colours::text }, { "CORRELATION", Colours::correlation },
                                      { "   - - REFERENCE", Colours::text.withAlpha (0.6f) } });
@@ -395,17 +402,67 @@ public:
     }
 
 private:
+    // Display only (the processing is not affected): mid and side averaged over 1/3 octave,
+    // the correlation over 2/3 octave; over time the correlation is calmed down more, too
+    static constexpr int levelWidth = 2, correlationWidth = 4;     // bands on each side (1/12 octave each)
+    static constexpr float levelSpeed = 0.35f, correlationSpeed = 0.12f;   // per update (25 per second)
+
+    static Spectrum::Curve average (const Spectrum::Curve& in, int width)
+    {
+        Spectrum::Curve out {};
+        for (int b = 0; b < Spectrum::numBands; ++b)
+        {
+            float sum = 0.0f;
+            int count = 0;
+            for (int i = juce::jmax (0, b - width); i <= juce::jmin (Spectrum::numBands - 1, b + width); ++i, ++count)
+                sum += in[(size_t) i];
+            out[(size_t) b] = sum / (float) count;
+        }
+        return out;
+    }
+
+    // Mid / side in dB (averaged as power) and the correlation, smoothed over frequency
+    static void curves (const Spectrum::Profile& p, Spectrum::Curve& mid, Spectrum::Curve& side, Spectrum::Curve& correlation)
+    {
+        Spectrum::Curve c {};
+        for (size_t b = 0; b < (size_t) Spectrum::numBands; ++b)
+            c[b] = p.correlation (b);
+        const auto m = average (p.mid, levelWidth), s = average (p.side, levelWidth);
+        for (size_t b = 0; b < (size_t) Spectrum::numBands; ++b)
+        {
+            mid[b]  = Spectrum::toDb (m[b]);
+            side[b] = Spectrum::toDb (s[b]);
+        }
+        correlation = average (c, correlationWidth);
+    }
+
     void timerCallback() override
     {
-        if (isShowing())
+        if (! isShowing())
+            return;
+
+        live = processor.getOutputProfile();
+        if (live.valid)
         {
-            live = processor.getOutputProfile();
-            repaint();
+            Spectrum::Curve mid, side, correlation;
+            curves (live, mid, side, correlation);
+            for (size_t b = 0; b < (size_t) Spectrum::numBands; ++b)
+            {
+                shownMid[b]  = started ? shownMid[b]  + levelSpeed * (mid[b]  - shownMid[b])  : mid[b];
+                shownSide[b] = started ? shownSide[b] + levelSpeed * (side[b] - shownSide[b]) : side[b];
+                shownCorrelation[b] = started ? shownCorrelation[b] + correlationSpeed * (correlation[b] - shownCorrelation[b])
+                                              : correlation[b];
+            }
+            started = true;
         }
+        repaint();
     }
 
     UlMaToProcessor& processor;
     Spectrum::Profile live, reference;
+    Spectrum::Curve shownMid {}, shownSide {}, shownCorrelation {};
+    Spectrum::Curve referenceMid {}, referenceSide {}, referenceCorrelation {};
+    bool started = false;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (LiveView)
 };
