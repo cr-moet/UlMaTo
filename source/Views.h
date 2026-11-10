@@ -471,9 +471,9 @@ private:
 // Dynamics page in multiband compressor style: one graph over frequency with the five
 // bands (crossovers marked, the output spectrum faintly behind).
 //  Upper part: the current gain of each band as a bar from 0 dB (red: cut, orange: boost),
-//              with a peak mark and the value.
-//  Lower part: per band name, range and ratio, and the dynamic range of reference,
-//              input and output as three bars (0 ... 24 dB across the band).
+//              with a peak mark.
+//  Lower part: per band the ratio, the dynamic range of reference, input and output as
+//              three bars (0 ... 24 dB across the band) and at the bottom the gain value.
 //==============================================================================
 class DynamicsView final : public juce::Component,
                            private juce::Timer
@@ -539,7 +539,7 @@ public:
         for (size_t b = 0; b < (size_t) Dynamics::numBands; ++b)
         {
             const auto column = juce::Rectangle<float>::leftTopRightBottom (xOf (edges[b]), plot.getY(), xOf (edges[b + 1]), plot.getBottom()).reduced (6.0f, 0.0f);
-            paintBand (g, b, column, gainArea, split, yOf);
+            paintBand (g, b, column, split, yOf);
         }
 
         if (! reference.valid)
@@ -553,7 +553,7 @@ public:
 
 private:
     template <typename YOf>
-    void paintBand (juce::Graphics& g, size_t b, juce::Rectangle<float> column, juce::Rectangle<float> gainArea, float split, YOf yOf)
+    void paintBand (juce::Graphics& g, size_t b, juce::Rectangle<float> column, float split, YOf yOf)
     {
         // Name and frequency range at the top
         g.setColour (Colours::text);
@@ -574,16 +574,9 @@ private:
                 g.setColour ((peak < 0.0f ? Colours::accent : Colours::correlation).withAlpha (0.9f));
                 g.fillRect (bar.getX(), yOf (peak) - 1.0f, bar.getWidth(), 2.0f);
             }
-        const auto valueBox = juce::Rectangle<float> (64.0f, 18.0f).withCentre ({ column.getCentreX(), gainArea.getBottom() - 8.0f });
-        g.setColour (Colours::text);
-        g.fillRect (valueBox);
-        g.setColour (Colours::accent);
-        g.setFont (juce::Font (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(), 11.0f, juce::Font::bold)));
-        g.drawText ((shownGains[b] < -0.05f ? "-" : shownGains[b] > 0.05f ? "+" : " ") + juce::String (std::abs (shownGains[b]), 1) + " dB",
-                    valueBox.reduced (4.0f, 0.0f), juce::Justification::centredRight);
-
-        // Lower part: ratio and the three ranges
+        // Lower part: the gain value at the very bottom, above it ratio and the three ranges
         auto lower = column.withTop (split + 6.0f).withTrimmedBottom (4.0f);
+
         const float slope = state.slope[b];
         g.setColour (Colours::text);
         g.setFont (juce::Font (juce::FontOptions (11.0f, juce::Font::bold)));
@@ -594,7 +587,7 @@ private:
         lower.removeFromTop (4.0f);
 
         const auto& input = state.fromLearned ? learned : state.input;
-        const float rowHeight = lower.getHeight() / 3.0f;
+        const float rowHeight = (lower.getHeight() - 26.0f) / 3.0f;   // room for the value below
         const auto rangeBar = [&] (const char* label, const Dynamics::Profile& p, juce::Colour colour, bool dashed)
         {
             auto row = lower.removeFromTop (juce::jmin (30.0f, rowHeight));
@@ -623,6 +616,15 @@ private:
         rangeBar ("REF", reference, Colours::text, true);
         rangeBar ("IN", input, Colours::text.withAlpha (0.35f), false);
         rangeBar ("OUT", state.output, Colours::accent, false);
+
+        // Gain value: in the middle of what is left between the bars and the bottom
+        const auto valueBox = lower.withSizeKeepingCentre (64.0f, 18.0f);
+        g.setColour (Colours::text);
+        g.fillRect (valueBox);
+        g.setColour (Colours::accent);
+        g.setFont (juce::Font (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(), 11.0f, juce::Font::bold)));
+        g.drawText ((shownGains[b] < -0.05f ? "-" : shownGains[b] > 0.05f ? "+" : " ") + juce::String (std::abs (shownGains[b]), 1) + " dB",
+                    valueBox.reduced (4.0f, 0.0f), juce::Justification::centredRight);
     }
 
     // The processed signal behind everything (mid, faint)
