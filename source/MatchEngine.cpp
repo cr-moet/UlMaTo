@@ -607,18 +607,23 @@ void MatchEngine::updateFilters (double seconds)
     else if (! ref.valid)
         dynamicMid = dynamicSide = {};
 
-    // MATCH scales the static and the dynamic part
+    // MATCH: the static correction from the learned input - its phase part fully in at 25 %,
+    // balance and mid/side at 50 % - stays full above; the dynamic part (levels only, never
+    // the phase) follows the knob from 0 to 100 %.
     // (the dynamic curves are smoothed once more: held and moving bands sit side by side)
     const float amount = currentAmount.load (std::memory_order_relaxed);
+    const float phaseAmount   = juce::jmin (1.0f, 4.0f * amount);
+    const float staticAmount  = juce::jmin (1.0f, 2.0f * amount);
+    const float dynamicAmount = amount;
     const auto dynMid = smooth (dynamicMid, maxDynamicDb), dynSide = smooth (dynamicSide, maxDynamicDb);
     Correction c;
     for (size_t b = 0; b < (size_t) numBands; ++b)
     {
-        c.left[b]  = amount * staticCorrection.left[b];
-        c.right[b] = amount * staticCorrection.right[b];
-        c.phase[b] = amount * staticCorrection.phase[b];
-        c.mid[b]   = amount * (staticCorrection.mid[b] + dynMid[b]);
-        c.side[b]  = amount * limitSide (b, staticCorrection.side[b] + dynSide[b]);
+        c.left[b]  = staticAmount * staticCorrection.left[b];
+        c.right[b] = staticAmount * staticCorrection.right[b];
+        c.phase[b] = phaseAmount * staticCorrection.phase[b];
+        c.mid[b]   = staticAmount * staticCorrection.mid[b] + dynamicAmount * dynMid[b];
+        c.side[b]  = limitSide (b, staticAmount * staticCorrection.side[b] + dynamicAmount * dynSide[b]);
     }
 
     // New filters only when something changed and the audio thread has taken the

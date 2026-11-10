@@ -65,7 +65,8 @@ public:
         std::array<bool, 6> bypass {};   // per stage (Stage order)
     };
 
-    // Audio thread. amount = 0 ... 1 (0 = no correction, signal only delayed),
+    // Audio thread. amount = 0 ... 1 (0 = no correction, signal only delayed; static phase
+    // full from 0.25 on, static levels from 0.5 on, the dynamic part follows amount),
     // response = time constant of the live analysis in seconds,
     // dynamicsAmount = 0 ... 1 (0 = dynamics stage off), stages: settings of the other stages
     void process (juce::AudioBuffer<float>& buffer, float amount, float response, float dynamicsAmount,

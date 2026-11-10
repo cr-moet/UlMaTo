@@ -140,7 +140,11 @@ UlMaToEditor::UlMaToEditor (UlMaToProcessor& p)
     }
     pages[MatchEngine::limiterStage].insert (pages[MatchEngine::limiterStage].end(), { &limiterView, &limiterOnButton, &truePeakButton });
 
-    pages[MatchEngine::eqStage] = { &stereoView, &midSideView, &phaseView, &liveView, &matchKnob, &responseKnob, &matchLabel, &responseLabel };
+    matchInfo.setFont (juce::Font (juce::FontOptions (11.0f)));
+    matchInfo.setJustificationType (juce::Justification::centred);
+    matchInfo.setColour (juce::Label::textColourId, Colours::text.withAlpha (0.7f));
+    addChildComponent (matchInfo);
+    pages[MatchEngine::eqStage] = { &stereoView, &midSideView, &phaseView, &liveView, &matchKnob, &responseKnob, &matchLabel, &responseLabel, &matchInfo };
     pages[MatchEngine::dynamicsStage] = { &dynamicsView, &dynamicsKnob, &dynamicsLabel, &dynamicsInfo };
 
     setResizable (true, true);
@@ -206,6 +210,11 @@ void UlMaToEditor::timerCallback()
             view->setProfiles (profile, learned);
         liveView.setReference (profile);
         dynamicsView.setReference (processorRef.getReferenceDynamics());
+
+        matchInfo.setText (processorRef.getLearnedProfile().valid
+                               ? "phase: full from 25 %\nstatic EQ: full from 50 %\ndynamic: 0 - 100 %"
+                               : "dynamic: 0 - 100 %\n(LEARN INPUT for the static part)",
+                           juce::dontSendNotification);
 
         dynamicsInfo.setText (! processorRef.getReferenceDynamics().valid
                                   ? "No dynamics of the reference yet:\npress ANALYZE"
@@ -377,6 +386,7 @@ void UlMaToEditor::resized()
 
     auto match = knobs.removeFromLeft (200);
     matchLabel.setBounds (match.removeFromTop (24));
+    matchInfo.setBounds (match.removeFromBottom (44));
     matchKnob.setBounds (match.withSizeKeepingCentre (match.getWidth(), juce::jmin (match.getHeight(), 240)));
 
     auto response = knobs.withTrimmedTop (knobs.getHeight() / 2 - 40);

@@ -88,6 +88,7 @@ private:
                                                          truePeakAttachment  { processorRef.apvts, ParamIDs::limiterTruePeak, truePeakButton };
 
     std::array<std::vector<juce::Component*>, MatchEngine::numStages> pages;
+    juce::Label matchInfo;   // what the MATCH range does right now
     juce::Rectangle<int> tabLine;
     int currentPage = 0;
     int shownReferenceVersion = -1, shownLearnedVersion = -1;
