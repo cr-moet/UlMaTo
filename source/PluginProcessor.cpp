@@ -147,7 +147,8 @@ juce::AudioProcessorValueTreeState::ParameterLayout UlMaToProcessor::createParam
         const auto i = "Phase " + juce::String (n + 1);
         layout.add (std::make_unique<juce::AudioParameterBool> (juce::ParameterID { ParamIDs::phaseOn[n], 1 }, i + " On", false));
         layout.add (std::make_unique<juce::AudioParameterChoice> (juce::ParameterID { ParamIDs::phaseSide[n], 1 }, i + " Channel", juce::StringArray { "Left", "Right" }, 0));
-        layout.add (std::make_unique<juce::AudioParameterChoice> (juce::ParameterID { ParamIDs::phaseShape[n], 1 }, i + " Shape", juce::StringArray { "Bell", "Shelf" }, 0));
+        layout.add (std::make_unique<juce::AudioParameterChoice> (juce::ParameterID { ParamIDs::phaseShape[n], 1 }, i + " Shape", juce::StringArray { "Bell", "Low Shelf", "High Shelf" }, 0));
+        layout.add (std::make_unique<juce::AudioParameterBool> (juce::ParameterID { ParamIDs::phaseBypass[n], 1 }, i + " Bypass", false));
         layout.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { ParamIDs::phaseFreq[n], 1 }, i + " Freq", freqRange, 1000.0f, hz));
         layout.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { ParamIDs::phaseAmount[n], 1 }, i + " Amount",
                                                                  juce::NormalisableRange<float> (-180.0f, 180.0f, 0.1f), 0.0f, degrees));
@@ -270,9 +271,9 @@ MatchEngine::StageSettings UlMaToProcessor::readStageSettings() const
     for (size_t n = 0; n < (size_t) Tone::numPhaseNodes; ++n)
     {
         auto& node   = s.phase.node[n];
-        node.on      = value (ParamIDs::phaseOn[n]) > 0.5f;
+        node.on      = value (ParamIDs::phaseOn[n]) > 0.5f && value (ParamIDs::phaseBypass[n]) < 0.5f;
         node.channel = value (ParamIDs::phaseSide[n]) > 0.5f ? 1 : 0;
-        node.shape   = value (ParamIDs::phaseShape[n]) > 0.5f ? Tone::PhaseShape::shelf : Tone::PhaseShape::bell;
+        node.shape   = (Tone::PhaseShape) juce::roundToInt (value (ParamIDs::phaseShape[n]));
         node.freq    = value (ParamIDs::phaseFreq[n]);
         node.amount  = value (ParamIDs::phaseAmount[n]);
         node.q       = value (ParamIDs::phaseQ[n]);

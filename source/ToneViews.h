@@ -17,7 +17,7 @@ public:
         startTimerHz (20);
     }
 
-    void resized() override   { plot = getLocalBounds().toFloat().withTrimmedTop (18.0f).withTrimmedLeft (40.0f).withTrimmedBottom (14.0f).withTrimmedRight (4.0f); }
+    void resized() override   { plot = getLocalBounds().toFloat().withTrimmedTop (18.0f).withTrimmedLeft (40.0f).withTrimmedBottom (14.0f + stripHeight).withTrimmedRight (4.0f); }
 
     void paint (juce::Graphics& g) override
     {
@@ -203,6 +203,7 @@ protected:
     juce::Colour curveColour = Colours::accent;
     juce::Rectangle<float> plot;
     float bottom, top, step;
+    float stripHeight = 0.0f;   // room below the frequency labels (for controls)
 
     juce::RangedAudioParameter* parameter (const char* id) const   { return processor.apvts.getParameter (id); }
 
@@ -349,117 +350,154 @@ protected:
 };
 
 //==============================================================================
-// PhaseQ node box: the controls of the selected node, shown at the bottom of the display:
-// channel (LEFT / RIGHT), shape (BELL / SHELF), REMOVE and the FREQ, PHASE and Q knobs
-class PhaseNodeBox final : public juce::Component,
-                           private juce::Timer
+// PhaseQ node names: the channel and the number among the nodes of that channel
+// (L1, L2, R1 ...), so a node switched to the right becomes the next free R number
+inline juce::String phaseNodeName (const juce::AudioProcessorValueTreeState& state, int node)
+{
+    const auto value = [&state] (const char* id) { return state.getRawParameterValue (id)->load(); };
+    const bool right = value (ParamIDs::phaseSide[node]) > 0.5f;
+    int number = 0;
+    for (int n = 0; n <= node; ++n)
+        if ((value (ParamIDs::phaseOn[n]) > 0.5f || n == node) && (value (ParamIDs::phaseSide[n]) > 0.5f) == right)
+            ++number;
+    return (right ? "R" : "L") + juce::String (number);
+}
+
+//==============================================================================
+// PhaseQ node strip: a thin row below the display with the controls of the selected
+// node - name, LEFT / RIGHT, shape (bell, low shelf, high shelf), BYPASS, FREQ, PHASE,
+// Q (small knobs) and X (remove) on the right
+class PhaseNodeStrip final : public juce::Component,
+                             private juce::Timer
 {
 public:
-    explicit PhaseNodeBox (juce::AudioProcessorValueTreeState& s) : state (s)
+    explicit PhaseNodeStrip (juce::AudioProcessorValueTreeState& s) : state (s)
     {
-        for (auto& [knob, label, text] : { std::tuple<juce::Slider&, juce::Label&, const char*> { knobs[0], labels[0], "FREQ" },
-                                           std::tuple<juce::Slider&, juce::Label&, const char*> { knobs[1], labels[1], "PHASE" },
-                                           std::tuple<juce::Slider&, juce::Label&, const char*> { knobs[2], labels[2], "Q" } })
+        for (size_t i = 0; i < knobs.size(); ++i)
         {
-            knob.setSliderStyle (juce::Slider::RotaryHorizontalVerticalDrag);
-            knob.setTextBoxStyle (juce::Slider::TextBoxBelow, false, 90, 20);
-            knob.setColour (juce::Slider::textBoxBackgroundColourId, Colours::text);
-            knob.setColour (juce::Slider::textBoxTextColourId, Colours::accent);
-            addAndMakeVisible (knob);
-            label.setText (text, juce::dontSendNotification);
-            label.setFont (juce::Font (juce::FontOptions (12.0f, juce::Font::bold)));
-            label.setJustificationType (juce::Justification::centred);
-            addAndMakeVisible (label);
+            knobs[i].setSliderStyle (juce::Slider::RotaryHorizontalVerticalDrag);
+            knobs[i].setTextBoxStyle (juce::Slider::TextBoxRight, false, 70, 20);
+            knobs[i].setColour (juce::Slider::textBoxBackgroundColourId, Colours::text);
+            knobs[i].setColour (juce::Slider::textBoxTextColourId, Colours::accent);
+            labels[i].setText (std::array { "FREQ", "PHASE", "Q" }[i], juce::dontSendNotification);
+            labels[i].setFont (juce::Font (juce::FontOptions (11.0f, juce::Font::bold)));
+            labels[i].setJustificationType (juce::Justification::centredLeft);
         }
-        for (auto& [button, id, index] : { std::tuple<juce::TextButton&, int, int> { leftButton, 0, 0 }, { rightButton, 0, 1 },
-                                           { bellButton, 1, 0 }, { shelfButton, 1, 1 } })
+        shapeBox.addItemList ({ "BELL", "LOW SHELF", "HIGH SHELF" }, 1);
+        for (auto [button, side] : { std::pair { &leftButton, 0 }, std::pair { &rightButton, 1 } })
         {
-            button.getProperties().set ("led", true);
-            button.onClick = [this, choice = id, option = index] { setChoice (choice == 0 ? ParamIDs::phaseSide[node] : ParamIDs::phaseShape[node], (float) option); };
-            addAndMakeVisible (button);
+            button->getProperties().set ("led", true);
+            button->onClick = [this, choice = side] { setSide (choice); };
         }
+        bypassButton.setClickingTogglesState (true);
+        bypassButton.getProperties().set ("led", true);
+        bypassButton.getProperties().set ("ledInverted", true);   // lit while the node is active
+        removeButton.setTooltip ("Remove this node");
         removeButton.onClick = [this] { if (onRemove != nullptr) onRemove(); };
-        addAndMakeVisible (removeButton);
+        for (auto* c : controls())
+            addChildComponent (c);
         startTimerHz (15);
     }
 
     std::function<void()> onRemove;
     int getNode() const noexcept   { return node; }
 
+    // Edit node n (-1: none selected - only a hint is shown)
     void bind (int n)
     {
         node = n;
-        const char* ids[] { ParamIDs::phaseFreq[n], ParamIDs::phaseAmount[n], ParamIDs::phaseQ[n] };
-        for (size_t i = 0; i < knobs.size(); ++i)
+        for (auto& a : attachments)
+            a.reset();
+        shapeAttachment.reset();
+        bypassAttachment.reset();
+        if (node >= 0)
         {
-            attachments[i].reset();
-            attachments[i] = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (state, ids[i], knobs[i]);
+            const char* ids[] { ParamIDs::phaseFreq[node], ParamIDs::phaseAmount[node], ParamIDs::phaseQ[node] };
+            for (size_t i = 0; i < knobs.size(); ++i)
+                attachments[i] = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (state, ids[i], knobs[i]);
+            shapeAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (state, ParamIDs::phaseShape[node], shapeBox);
+            bypassAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (state, ParamIDs::phaseBypass[node], bypassButton);
         }
+        for (auto* c : controls())
+            c->setVisible (node >= 0);
         refresh();
+        repaint();
     }
 
     void paint (juce::Graphics& g) override
     {
-        const auto r = getLocalBounds().toFloat().reduced (1.0f);
-        g.setColour (Colours::background.withAlpha (0.96f));
-        g.fillRoundedRectangle (r, 6.0f);
-        g.setColour (Colours::text.withAlpha (0.6f));
-        g.drawRoundedRectangle (r, 6.0f, 1.2f);
+        const auto r = getLocalBounds().toFloat().reduced (0.5f);
+        g.setColour (Colours::text.withAlpha (0.06f));
+        g.fillRoundedRectangle (r, 4.0f);
+        g.setColour (Colours::text.withAlpha (0.45f));
+        g.drawRoundedRectangle (r, 4.0f, 1.0f);
         g.setColour (Colours::text);
-        g.setFont (juce::Font (juce::FontOptions (13.0f, juce::Font::bold)));
-        g.drawText ("NODE " + juce::String (channel == 0 ? "L" : "R") + juce::String (node + 1), titleArea, juce::Justification::centredLeft);
+        if (node >= 0)
+        {
+            g.setFont (juce::Font (juce::FontOptions (14.0f, juce::Font::bold)));
+            g.drawText (name, nameArea, juce::Justification::centred);
+        }
+        else
+        {
+            g.setColour (Colours::text.withAlpha (0.6f));
+            g.setFont (juce::Font (juce::FontOptions (12.0f)));
+            g.drawText ("no node selected  -  double-click into the display to create one", getLocalBounds().reduced (12, 0), juce::Justification::centredLeft);
+        }
     }
 
     void resized() override
     {
-        auto r = getLocalBounds().reduced (12, 8);
-        auto buttons = r.removeFromLeft (190);
-        r.removeFromLeft (12);
-        titleArea = buttons.removeFromTop (22);
-        buttons.removeFromTop (4);
-        const auto pair = [&buttons] (juce::TextButton& a, juce::TextButton& b)
-        {
-            auto row = buttons.removeFromTop (32);
-            a.setBounds (row.removeFromLeft (row.getWidth() / 2 - 3));
-            b.setBounds (row.removeFromRight (row.getWidth() - 6));
-            buttons.removeFromTop (6);
-        };
-        pair (leftButton, rightButton);
-        pair (bellButton, shelfButton);
-        removeButton.setBounds (buttons.removeFromTop (28));
+        auto r = getLocalBounds().reduced (8, 6);
+        const auto gap = [&r] (int w) { r.removeFromLeft (w); };
+        removeButton.setBounds (r.removeFromRight (32).withSizeKeepingCentre (30, 30));
+        nameArea = r.removeFromLeft (44);
+        gap (6);
+        const auto centred = [] (juce::Rectangle<int> c) { return c.withSizeKeepingCentre (c.getWidth(), 30); };
+        leftButton.setBounds (centred (r.removeFromLeft (62)));
+        gap (4);
+        rightButton.setBounds (centred (r.removeFromLeft (62)));
+        gap (10);
+        shapeBox.setBounds (centred (r.removeFromLeft (130)));
+        gap (10);
+        bypassButton.setBounds (centred (r.removeFromLeft (86)));
+        gap (14);
 
-        const int w = r.getWidth() / (int) knobs.size();
+        const int w = juce::jmin (180, r.getWidth() / (int) knobs.size());
         for (size_t i = 0; i < knobs.size(); ++i)
         {
             auto cell = r.removeFromLeft (w);
-            labels[i].setBounds (cell.removeFromTop (16));
-            knobs[i].setBounds (cell);
+            const int knobSize = juce::jmin (cell.getHeight(), 50);
+            knobs[i].setBounds (cell.withTrimmedRight (cell.getWidth() - knobSize - 78));
+            labels[i].setBounds (cell.getX() + knobSize + 4, cell.getY() - 2, 76, 14);
         }
     }
 
 private:
-    float value (const char* id) const   { return state.getRawParameterValue (id)->load(); }
-
-    void setChoice (const char* id, float index)
+    std::vector<juce::Component*> controls()
     {
-        auto* p = state.getParameter (id);
+        return { &knobs[0], &knobs[1], &knobs[2], &labels[0], &labels[1], &labels[2],
+                 &leftButton, &rightButton, &shapeBox, &bypassButton, &removeButton };
+    }
+
+    void setSide (int side)
+    {
+        auto* p = state.getParameter (ParamIDs::phaseSide[node]);
         p->beginChangeGesture();
-        p->setValueNotifyingHost (p->convertTo0to1 (index));
+        p->setValueNotifyingHost (p->convertTo0to1 ((float) side));
         p->endChangeGesture();
         refresh();
     }
 
     void refresh()
     {
-        const int newChannel = value (ParamIDs::phaseSide[node]) > 0.5f ? 1 : 0;
-        const bool shelf = value (ParamIDs::phaseShape[node]) > 0.5f;
-        leftButton.setToggleState (newChannel == 0, juce::dontSendNotification);
-        rightButton.setToggleState (newChannel == 1, juce::dontSendNotification);
-        bellButton.setToggleState (! shelf, juce::dontSendNotification);
-        shelfButton.setToggleState (shelf, juce::dontSendNotification);
-        if (newChannel != channel)
+        if (node < 0)
+            return;
+        const bool right = state.getRawParameterValue (ParamIDs::phaseSide[node])->load() > 0.5f;
+        leftButton.setToggleState (! right, juce::dontSendNotification);
+        rightButton.setToggleState (right, juce::dontSendNotification);
+        if (const auto newName = phaseNodeName (state, node); newName != name)
         {
-            channel = newChannel;
+            name = newName;
             repaint();
         }
     }
@@ -471,42 +509,47 @@ private:
     }
 
     juce::AudioProcessorValueTreeState& state;
-    std::array<juce::Slider, 3> knobs;
+    std::array<juce::Slider, 3> knobs;   // freq, phase, Q
     std::array<juce::Label, 3> labels;
     std::array<std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment>, 3> attachments;
-    juce::TextButton leftButton { "LEFT" }, rightButton { "RIGHT" }, bellButton { "BELL" }, shelfButton { "SHELF" }, removeButton { "REMOVE" };
-    juce::Rectangle<int> titleArea;
-    int node = 0, channel = 0;
+    juce::ComboBox shapeBox;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> shapeAttachment;
+    juce::TextButton leftButton { "LEFT" }, rightButton { "RIGHT" }, bypassButton { "BYPASS" }, removeButton { "X" };
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> bypassAttachment;
+    juce::Rectangle<int> nameArea;
+    juce::String name;
+    int node = -1;
 };
 
 //==============================================================================
 // PhaseQ: both channels in one graph - left solid, right dashed (both orange). It starts
-// without nodes; a double-click on the graph creates one (on a node: removes it). The box
-// at the bottom edits the selected node.
+// without nodes; a double-click on the graph creates one (on a node: removes it). The strip
+// below the display edits the selected node.
 class PhaseQView final : public NodeEditor
 {
 public:
     explicit PhaseQView (UlMaToProcessor& p)
         : NodeEditor (p, juce::String (juce::CharPointer_UTF8 ("PHASEQ  [\xc2\xb0]  -  LEFT solid, RIGHT dashed  (only the phase changes, the level stays flat)")),
                       -180.0f, 180.0f, 45.0f),
-          box (p.apvts)
+          strip (p.apvts)
     {
         curveColour = Colours::correlation;
         hint = "double-click: new node / remove node  -  drag a node  -  wheel: Q";
-        addChildComponent (box);
-        box.onRemove = [this] { remove (selected); };
-        onSelect = [this] (int) { updateBox(); };
+        stripHeight = 74.0f;
+        addAndMakeVisible (strip);
+        strip.onRemove = [this] { remove (selected); };
+        onSelect = [this] (int) { updateStrip(); };
         selected = -1;
         for (int n = numNodes(); --n >= 0;)
             if (isActive (n))
                 selected = n;
-        updateBox();
+        updateStrip();
     }
 
     void resized() override
     {
         NodeEditor::resized();
-        placeBox();
+        strip.setBounds (getLocalBounds().removeFromBottom (62).withTrimmedLeft ((int) plot.getX()).withTrimmedRight (4));
     }
 
     void mouseDoubleClick (const juce::MouseEvent& e) override
@@ -524,19 +567,21 @@ protected:
     const char* valueId (int n) const override  { return ParamIDs::phaseAmount[n]; }
     const char* widthId (int n) const override  { return ParamIDs::phaseQ[n]; }
 
-    int channelOf (int n) const   { return value (ParamIDs::phaseSide[n]) > 0.5f ? 1 : 0; }
-    bool isShelf (int n) const    { return value (ParamIDs::phaseShape[n]) > 0.5f; }
+    int channelOf (int n) const       { return value (ParamIDs::phaseSide[n]) > 0.5f ? 1 : 0; }
+    bool isBypassed (int n) const     { return value (ParamIDs::phaseBypass[n]) > 0.5f; }
+    Tone::PhaseShape shapeOf (int n) const   { return (Tone::PhaseShape) juce::roundToInt (value (ParamIDs::phaseShape[n])); }
 
-    Tone::PhaseSettings settings() const
+    // withBypassed: bypassed nodes count too (for their own faint curve)
+    Tone::PhaseSettings settings (bool withBypassed = false) const
     {
         Tone::PhaseSettings s;
         for (int n = 0; n < Tone::numPhaseNodes; ++n)
-            s.node[(size_t) n] = { isActive (n), channelOf (n), isShelf (n) ? Tone::PhaseShape::shelf : Tone::PhaseShape::bell,
+            s.node[(size_t) n] = { isActive (n) && (withBypassed || ! isBypassed (n)), channelOf (n), shapeOf (n),
                                    value (ParamIDs::phaseFreq[n]), value (ParamIDs::phaseAmount[n]), value (ParamIDs::phaseQ[n]) };
         return s;
     }
 
-    float nodeCurve (int n, float f) const override   { return juce::radiansToDegrees (Tone::phaseAt (settings(), channelOf (n), f, n)); }
+    float nodeCurve (int n, float f) const override   { return juce::radiansToDegrees (Tone::phaseAt (settings (true), channelOf (n), f, n)); }
     float totalCurve (float f) const override         { return juce::radiansToDegrees (Tone::phaseAt (settings(), 0, f)); }
 
     void drawTotals (juce::Graphics& g) override
@@ -549,15 +594,17 @@ protected:
     void drawNode (juce::Graphics& g, int n, juce::Point<float> c, bool on) override
     {
         const auto r = juce::Rectangle<float> (26.0f, 16.0f).withCentre (c);
-        const bool right = channelOf (n) == 1;
-        g.setColour (on ? curveColour : (right ? Colours::display : curveColour.withAlpha (0.45f)));
-        g.fillRoundedRectangle (r, isShelf (n) ? 2.0f : 8.0f);   // shelf: square corners
-        g.setColour (on ? Colours::background : Colours::text);
+        const bool right = channelOf (n) == 1, bypassed = isBypassed (n);
+        const float corner = shapeOf (n) == Tone::PhaseShape::bell ? 8.0f : 2.0f;   // shelves: square corners
+        const auto fill = bypassed ? Colours::display.brighter (0.25f) : curveColour;
+        g.setColour (on ? fill : (right ? Colours::display : fill.withAlpha (0.45f)));
+        g.fillRoundedRectangle (r, corner);
+        g.setColour (on && ! bypassed ? Colours::background : Colours::text.withAlpha (bypassed ? 0.55f : 1.0f));
         g.setFont (juce::Font (juce::FontOptions (10.0f, juce::Font::bold)));
-        g.drawText ((right ? "R" : "L") + juce::String (n + 1), r, juce::Justification::centred);
-        g.setColour (Colours::text);
+        g.drawText (phaseNodeName (processor.apvts, n), r, juce::Justification::centred);
+        g.setColour (Colours::text.withAlpha (bypassed ? 0.55f : 1.0f));
         juce::Path outline;
-        outline.addRoundedRectangle (r, isShelf (n) ? 2.0f : 8.0f);
+        outline.addRoundedRectangle (r, corner);
         if (right)
         {
             juce::Path dashed;
@@ -571,8 +618,9 @@ protected:
 
     juce::String describe (int n) const override
     {
+        static constexpr const char* shapes[] { "BELL", "LOW SHELF", "HIGH SHELF" };
         const float f = value (ParamIDs::phaseFreq[n]), amount = value (ParamIDs::phaseAmount[n]);
-        return (channelOf (n) == 0 ? "L" : "R") + juce::String (n + 1) + (isShelf (n) ? "  SHELF   " : "  BELL   ")
+        return phaseNodeName (processor.apvts, n) + "  " + shapes[(int) shapeOf (n)] + (isBypassed (n) ? " (BYPASSED)   " : "   ")
              + (f < 1000.0f ? juce::String (f, 0) + " Hz" : juce::String (f / 1000.0f, 2) + " kHz") + "   "
              + (amount > 0.0f ? "+" : "") + juce::String (amount, 0) + juce::String (juce::CharPointer_UTF8 ("\xc2\xb0"))
              + "   Q " + juce::String (value (ParamIDs::phaseQ[n]), 2);
@@ -582,34 +630,18 @@ private:
     void timerCallback() override
     {
         NodeEditor::timerCallback();
-        updateBox();   // nodes can also change from the host (automation, undo, presets)
+        updateStrip();   // nodes can also change from the host (automation, undo, presets)
     }
 
-    void updateBox()
+    void updateStrip()
     {
         if (selected >= 0 && ! isActive (selected))
             selected = -1;
-        const bool show = selected >= 0;
-        if (show && (box.getNode() != selected || ! box.isVisible()))
-            box.bind (selected);
-        if (show && dragNode < 0)
-            placeBox();
-        box.setVisible (show);
+        if (strip.getNode() != selected)
+            strip.bind (selected);
     }
 
-    // The box at the bottom of the display - or at the top while the selected node is in the
-    // lower half, so it never hides the node
-    void placeBox()
-    {
-        const auto area = plot.toNearestInt().reduced (10, 22);
-        const bool atTop = selected >= 0 && isActive (selected) && value (ParamIDs::phaseAmount[selected]) < 0.0f;
-        const auto r = area.withSizeKeepingCentre (juce::jmin (area.getWidth(), 600), 140);
-        const auto bounds = atTop ? r.withY (area.getY()) : r.withBottomY (area.getBottom());
-        if (bounds != box.getBounds())
-            box.setBounds (bounds);
-    }
-
-    // A new node where the mouse is: the first free one, left channel, bell, Q 1
+    // A new node where the mouse is: the first free one, left channel, bell, Q 1, active
     void create (juce::Point<float> p)
     {
         for (int n = 0; n < numNodes(); ++n)
@@ -621,6 +653,7 @@ private:
                 setWithGesture (ParamIDs::phaseQ[n], 1.0f);
                 setWithGesture (ParamIDs::phaseSide[n], 0.0f);
                 setWithGesture (ParamIDs::phaseShape[n], 0.0f);
+                setWithGesture (ParamIDs::phaseBypass[n], 0.0f);
                 setWithGesture (ParamIDs::phaseOn[n], 1.0f);
                 select (n, true);
                 return;
@@ -644,11 +677,11 @@ private:
                     break;
                 }
         }
-        updateBox();
+        updateStrip();
         repaint();
     }
 
-    PhaseNodeBox box;
+    PhaseNodeStrip strip;
 };
 
 //==============================================================================

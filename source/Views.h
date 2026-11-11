@@ -19,12 +19,34 @@ namespace Plot
         return r.getY() + r.getHeight() * juce::jlimit (0.0f, 1.0f, (top - value) / (top - bottom));
     }
 
+    // Raised panel (the boxes the knobs sit on): soft shadow down right, slightly rounded
+    // corners, light upper / left edge and darker lower / right edge
     inline void drawPanel (juce::Graphics& g, juce::Rectangle<float> r)
     {
-        g.setColour (Colours::panel);
-        g.fillRect (r);
-        g.setColour (Colours::text.withAlpha (0.5f));
-        g.drawRect (r, 1.0f);
+        constexpr float corner = 4.0f;
+        for (int i = 1; i <= 4; ++i)
+        {
+            g.setColour (juce::Colours::black.withAlpha (0.045f));
+            g.fillRoundedRectangle (r.translated (1.0f + 0.5f * (float) i, 1.5f + 0.75f * (float) i).expanded ((float) i * 0.5f), corner + (float) i * 0.5f);
+        }
+        g.setGradientFill (juce::ColourGradient (Colours::panel.brighter (0.3f), r.getTopLeft(), Colours::panel.darker (0.03f), r.getBottomLeft(), false));
+        g.fillRoundedRectangle (r, corner);
+
+        juce::Path lit, shaded;   // edges: light from the top left
+        lit.startNewSubPath (r.getX() + 0.5f, r.getBottom() - corner);
+        lit.lineTo (r.getX() + 0.5f, r.getY() + corner);
+        lit.quadraticTo (r.getX() + 0.5f, r.getY() + 0.5f, r.getX() + corner, r.getY() + 0.5f);
+        lit.lineTo (r.getRight() - corner, r.getY() + 0.5f);
+        shaded.startNewSubPath (r.getRight() - 0.5f, r.getY() + corner);
+        shaded.lineTo (r.getRight() - 0.5f, r.getBottom() - corner);
+        shaded.quadraticTo (r.getRight() - 0.5f, r.getBottom() - 0.5f, r.getRight() - corner, r.getBottom() - 0.5f);
+        shaded.lineTo (r.getX() + corner, r.getBottom() - 0.5f);
+        g.setColour (juce::Colours::white.withAlpha (0.9f));
+        g.strokePath (lit, juce::PathStrokeType (1.2f));
+        g.setColour (Colours::text.withAlpha (0.35f));
+        g.strokePath (shaded, juce::PathStrokeType (1.2f));
+        g.setColour (Colours::text.withAlpha (0.18f));
+        g.drawRoundedRectangle (r.reduced (0.0f), corner, 0.8f);
     }
 
     // Graphic display: grey screen set into the front panel - dark edge and inner shadow at

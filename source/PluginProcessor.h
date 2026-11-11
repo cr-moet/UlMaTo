@@ -24,9 +24,10 @@ namespace ParamIDs
     inline constexpr const char* eqGain[] { "eqGain1", "eqGain2", "eqGain3", "eqGain4", "eqGain5", "eqGain6" };
     inline constexpr const char* eqQ[]    { "eqQ1", "eqQ2", "eqQ3", "eqQ4", "eqQ5", "eqQ6" };
 
-    // PhaseQ: twelve nodes (off until created), each left or right, bell or shelf
+    // PhaseQ: twelve nodes (off until created), each left or right, bell / low shelf / high shelf, bypassable
     inline constexpr const char* phaseOn[12] { "phaseOn1", "phaseOn2", "phaseOn3", "phaseOn4", "phaseOn5", "phaseOn6", "phaseOn7", "phaseOn8", "phaseOn9", "phaseOn10", "phaseOn11", "phaseOn12" };
     inline constexpr const char* phaseSide[12] { "phaseSide1", "phaseSide2", "phaseSide3", "phaseSide4", "phaseSide5", "phaseSide6", "phaseSide7", "phaseSide8", "phaseSide9", "phaseSide10", "phaseSide11", "phaseSide12" };
+    inline constexpr const char* phaseBypass[12] { "phaseBypass1", "phaseBypass2", "phaseBypass3", "phaseBypass4", "phaseBypass5", "phaseBypass6", "phaseBypass7", "phaseBypass8", "phaseBypass9", "phaseBypass10", "phaseBypass11", "phaseBypass12" };
     inline constexpr const char* phaseShape[12] { "phaseShape1", "phaseShape2", "phaseShape3", "phaseShape4", "phaseShape5", "phaseShape6", "phaseShape7", "phaseShape8", "phaseShape9", "phaseShape10", "phaseShape11", "phaseShape12" };
     inline constexpr const char* phaseFreq[12] { "phaseFreq1", "phaseFreq2", "phaseFreq3", "phaseFreq4", "phaseFreq5", "phaseFreq6", "phaseFreq7", "phaseFreq8", "phaseFreq9", "phaseFreq10", "phaseFreq11", "phaseFreq12" };
     inline constexpr const char* phaseAmount[12] { "phaseAmount1", "phaseAmount2", "phaseAmount3", "phaseAmount4", "phaseAmount5", "phaseAmount6", "phaseAmount7", "phaseAmount8", "phaseAmount9", "phaseAmount10", "phaseAmount11", "phaseAmount12" };

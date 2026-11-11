@@ -8,7 +8,7 @@
 // PhaseQ and graphic EQ: settings, their curves and the FIR stage that runs them.
 //
 // PhaseQ   - changes only the phase (the magnitude stays exactly flat): up to twelve
-//            nodes, each on the left or right channel, a bell or a shelf of phase over
+//            nodes, each on the left or right channel, a bell or a low / high shelf of phase over
 //            frequency with its own Q.
 // Graphic  - six bands (low shelf, four bells, high shelf), linear phase: only the
 // EQ         magnitude changes.
@@ -83,7 +83,7 @@ namespace Tone
     //==========================================================================
     // PhaseQ: up to twelve nodes, each on the left or the right channel, bell or shelf
     inline constexpr int numPhaseNodes = 12;
-    enum class PhaseShape { bell, shelf };
+    enum class PhaseShape { bell, lowShelf, highShelf };
 
     struct PhaseNode
     {
@@ -110,11 +110,18 @@ namespace Tone
     inline float octavesOfQ (float q)   { return 2.0f / std::log (2.0f) * std::asinh (1.0f / (2.0f * juce::jmax (0.05f, q))); }
 
     // Phase (degrees) of one node at f: bell = Gaussian bump over log frequency as wide as
-    // the bandwidth of its Q; shelf = smooth step from 0 (below) to the amount (above)
+    // the bandwidth of its Q; shelves = smooth step between 0 and the amount (high shelf:
+    // the amount above the frequency, low shelf: below it), Q sets the steepness
     inline float nodePhase (const PhaseNode& n, float f)
     {
         const float d = (std::log2 (juce::jmax (1.0f, f)) - std::log2 (n.freq)) / (0.5f * octavesOfQ (n.q));
-        return n.amount * (n.shape == PhaseShape::bell ? std::exp (-0.5f * d * d) : 0.5f * (1.0f + std::tanh (d)));
+        switch (n.shape)
+        {
+            case PhaseShape::lowShelf:  return n.amount * 0.5f * (1.0f - std::tanh (d));
+            case PhaseShape::highShelf: return n.amount * 0.5f * (1.0f + std::tanh (d));
+            case PhaseShape::bell:      break;
+        }
+        return n.amount * std::exp (-0.5f * d * d);
     }
 
     // Phase (radians) of one channel at f: sum of its nodes (only = just this node), faded
