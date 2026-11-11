@@ -139,22 +139,22 @@ juce::AudioProcessorValueTreeState::ParameterLayout UlMaToProcessor::createParam
                                                                  Tone::eqTypes[b] == Tone::EqType::bell ? 1.0f : 0.71f));
     }
 
-    // PhaseQ
+    // PhaseQ: left and right
     const auto degrees = juce::AudioParameterFloatAttributes().withLabel ("deg")
                              .withStringFromValueFunction ([] (float v, int) { return (v > 0.0f ? "+" : "") + juce::String (v, 0) + juce::String (juce::CharPointer_UTF8 ("\xc2\xb0")); });
-    for (int n = 0; n < Tone::numBands; ++n)
+    for (int n = 0; n < Tone::numPhaseNodes; ++n)
     {
-        const auto i = juce::String (n + 1);
-        layout.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { ParamIDs::phaseFreq[n], 1 }, "Phase " + i + " Freq", freqRange, Tone::phaseDefaultFreq[n], hz));
-        layout.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { ParamIDs::phaseAmount[n], 1 }, "Phase " + i + " Amount",
+        const auto i = "Phase " + juce::String (n + 1);
+        layout.add (std::make_unique<juce::AudioParameterBool> (juce::ParameterID { ParamIDs::phaseOn[n], 1 }, i + " On", false));
+        layout.add (std::make_unique<juce::AudioParameterChoice> (juce::ParameterID { ParamIDs::phaseSide[n], 1 }, i + " Channel", juce::StringArray { "Left", "Right" }, 0));
+        layout.add (std::make_unique<juce::AudioParameterChoice> (juce::ParameterID { ParamIDs::phaseShape[n], 1 }, i + " Shape", juce::StringArray { "Bell", "Shelf" }, 0));
+        layout.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { ParamIDs::phaseFreq[n], 1 }, i + " Freq", freqRange, 1000.0f, hz));
+        layout.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { ParamIDs::phaseAmount[n], 1 }, i + " Amount",
                                                                  juce::NormalisableRange<float> (-180.0f, 180.0f, 0.1f), 0.0f, degrees));
-        layout.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { ParamIDs::phaseWidth[n], 1 }, "Phase " + i + " Width",
-                                                                 juce::NormalisableRange<float> (0.2f, 4.0f, 0.01f), 1.0f,
-                                                                 juce::AudioParameterFloatAttributes().withLabel ("oct")));
+        layout.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { ParamIDs::phaseQ[n], 1 }, i + " Q", qRange, 1.0f,
+                                                                 juce::AudioParameterFloatAttributes()
+                                                                     .withStringFromValueFunction ([] (float v, int) { return juce::String (v, 2); })));
     }
-    layout.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { ParamIDs::phaseRotation, 1 }, "Phase Rotation",
-                                                             juce::NormalisableRange<float> (-180.0f, 180.0f, 0.1f), 0.0f, degrees));
-    layout.add (std::make_unique<juce::AudioParameterChoice> (juce::ParameterID { ParamIDs::phaseMode, 1 }, "Phase Mode", Tone::phaseModeNames, 0));
 
     // Limiter
     juce::NormalisableRange<float> releaseRange (1.0f, 1000.0f, 0.1f);
@@ -266,12 +266,18 @@ MatchEngine::StageSettings UlMaToProcessor::readStageSettings() const
         s.eq.freq[b] = value (ParamIDs::eqFreq[b]);
         s.eq.gain[b] = value (ParamIDs::eqGain[b]);
         s.eq.q[b]    = value (ParamIDs::eqQ[b]);
-        s.phase.freq[b]   = value (ParamIDs::phaseFreq[b]);
-        s.phase.amount[b] = value (ParamIDs::phaseAmount[b]);
-        s.phase.width[b]  = value (ParamIDs::phaseWidth[b]);
     }
-    s.phase.rotation = value (ParamIDs::phaseRotation);
-    s.phase.mode     = juce::roundToInt (value (ParamIDs::phaseMode));
+    for (size_t n = 0; n < (size_t) Tone::numPhaseNodes; ++n)
+    {
+        auto& node   = s.phase.node[n];
+        node.on      = value (ParamIDs::phaseOn[n]) > 0.5f;
+        node.channel = value (ParamIDs::phaseSide[n]) > 0.5f ? 1 : 0;
+        node.shape   = value (ParamIDs::phaseShape[n]) > 0.5f ? Tone::PhaseShape::shelf : Tone::PhaseShape::bell;
+        node.freq    = value (ParamIDs::phaseFreq[n]);
+        node.amount  = value (ParamIDs::phaseAmount[n]);
+        node.q       = value (ParamIDs::phaseQ[n]);
+    }
+    s.phase.valid = true;
 
     s.limiter.on        = value (ParamIDs::limiterOn) > 0.5f;
     s.limiter.truePeak  = value (ParamIDs::limiterTruePeak) > 0.5f;

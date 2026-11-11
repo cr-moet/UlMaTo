@@ -27,6 +27,30 @@ namespace Plot
         g.drawRect (r, 1.0f);
     }
 
+    // Graphic display: grey screen set into the front panel - dark edge and inner shadow at
+    // the top and left, a light edge at the bottom and right
+    inline void drawDisplay (juce::Graphics& g, juce::Rectangle<float> r)
+    {
+        g.setColour (Colours::display);
+        g.fillRect (r);
+
+        const auto shade = [&g] (juce::Rectangle<float> band, juce::Point<float> from, juce::Point<float> to, float alpha)
+        {
+            g.setGradientFill (juce::ColourGradient (juce::Colours::black.withAlpha (alpha), from, juce::Colours::transparentBlack, to, false));
+            g.fillRect (band);
+        };
+        const float top = juce::jmin (10.0f, r.getHeight() * 0.25f), left = juce::jmin (7.0f, r.getWidth() * 0.25f);
+        shade (r.withHeight (top), r.getTopLeft(), r.getTopLeft().translated (0.0f, top), 0.38f);
+        shade (r.withWidth (left), r.getTopLeft(), r.getTopLeft().translated (left, 0.0f), 0.25f);
+
+        g.setColour (juce::Colours::black.withAlpha (0.55f));             // edge of the cut-out
+        g.drawLine (r.getX() - 0.5f, r.getY() - 0.5f, r.getRight() + 0.5f, r.getY() - 0.5f, 1.5f);
+        g.drawLine (r.getX() - 0.5f, r.getY() - 0.5f, r.getX() - 0.5f, r.getBottom() + 0.5f, 1.5f);
+        g.setColour (juce::Colours::white.withAlpha (0.75f));
+        g.drawLine (r.getX() - 1.0f, r.getBottom() + 1.0f, r.getRight() + 1.0f, r.getBottom() + 1.0f, 1.5f);
+        g.drawLine (r.getRight() + 1.0f, r.getY() - 1.0f, r.getRight() + 1.0f, r.getBottom() + 1.0f, 1.5f);
+    }
+
     // Frequency lines (labels below the plot if 'labels') and level lines (labels left)
     inline void drawGrid (juce::Graphics& g, juce::Rectangle<float> r, float top, float bottom, float step,
                           bool labels, const juce::String& unit = {})
@@ -118,7 +142,7 @@ public:
     void paint (juce::Graphics& g) override
     {
         const auto r = getLocalBounds().toFloat();
-        Plot::drawPanel (g, r);
+        Plot::drawDisplay (g, r);
 
         const double length = thumbnail.getTotalLength();
         if (length <= 0.0)
@@ -271,7 +295,7 @@ public:
         g.drawText (title, r.removeFromTop (18.0f), juce::Justification::centredLeft);
 
         const auto plot = r.withTrimmedLeft (40.0f).withTrimmedBottom (14.0f);
-        Plot::drawPanel (g, plot);
+        Plot::drawDisplay (g, plot);
 
         const bool phase = kind == Kind::phase;
         const float top = phase ? 1.0f : 0.0f, bottom = phase ? -1.0f : -96.0f;
@@ -361,7 +385,7 @@ public:
 
         const auto plot = r.withTrimmedLeft (40.0f).withTrimmedRight (34.0f).withTrimmedBottom (14.0f);
         constexpr float top = 0.0f, bottom = -96.0f;
-        Plot::drawPanel (g, plot);
+        Plot::drawDisplay (g, plot);
         Plot::drawGrid (g, plot, top, bottom, 12.0f, true);
 
         // Phase correlation on its own scale (right): +1 at the top, -1 at the bottom
@@ -495,7 +519,7 @@ public:
         area.removeFromTop (4.0f);
 
         const auto plot = area.withTrimmedLeft (40.0f).withTrimmedBottom (14.0f);
-        Plot::drawPanel (g, plot);
+        Plot::drawDisplay (g, plot);
         const float split = plot.getY() + plot.getHeight() * 0.66f;   // gain above, ranges below
         const auto gainArea = juce::Rectangle<float>::leftTopRightBottom (plot.getX(), plot.getY() + 34.0f, plot.getRight(), split - 6.0f);
 

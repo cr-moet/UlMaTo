@@ -8,7 +8,7 @@
 //  EQ MATCH    - the three analysis displays, the output spectrum, MATCH / RESPONSE
 //  DYNAMICS    - level distributions per band, DYNAMICS knob
 //  ANALOG HEAT - tape saturation per band, wow, flutter, crackle, tube, transformer
-//  PHASEQ      - phase nodes, rotation, mode
+//  PHASEQ      - left and right in one graph, nodes created by double-click
 //  GRAPHIC EQ  - six band nodes
 //  LIMITER     - reduction / output history, input, ceiling, release, link
 //==============================================================================
@@ -73,11 +73,8 @@ private:
     juce::Rectangle<int> tapePanel, transportPanel, outputPanel;
 
     // PhaseQ, graphic EQ, limiter pages
+    // PhaseQ: one graph for both channels, with the box of the selected node inside
     PhaseQView phaseQView { processorRef };
-    LabelledKnob rotationKnob;
-    juce::ComboBox phaseModeBox;
-    juce::Label phaseModeLabel;
-    std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> phaseModeAttachment;
 
     GraphicEqView graphicEqView { processorRef };
 

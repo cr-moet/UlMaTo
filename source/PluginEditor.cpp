@@ -110,17 +110,9 @@ UlMaToEditor::UlMaToEditor (UlMaToProcessor& p)
     for (auto& k : tapeKnobs)
         k.label.setFont (juce::Font (juce::FontOptions (12.0f, juce::Font::bold)));
 
-    // PhaseQ: nodes, rotation, mode
+    // PhaseQ
     addChildComponent (phaseQView);
-    setUpKnobOn (MatchEngine::phaseStage, rotationKnob, ParamIDs::phaseRotation, "ROTATION");
-    phaseModeBox.addItemList (Tone::phaseModeNames, 1);
-    phaseModeAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (processorRef.apvts, ParamIDs::phaseMode, phaseModeBox);
-    addChildComponent (phaseModeBox);
-    phaseModeLabel.setText ("APPLY TO", juce::dontSendNotification);
-    phaseModeLabel.setFont (juce::Font (juce::FontOptions (12.0f, juce::Font::bold)));
-    phaseModeLabel.setJustificationType (juce::Justification::centred);
-    addChildComponent (phaseModeLabel);
-    pages[MatchEngine::phaseStage].insert (pages[MatchEngine::phaseStage].end(), { &phaseQView, &phaseModeBox, &phaseModeLabel });
+    pages[MatchEngine::phaseStage] = { &phaseQView };
 
     // Graphic EQ
     addChildComponent (graphicEqView);
@@ -319,21 +311,8 @@ void UlMaToEditor::resized()
         placeRow (outputPanel, heatKnobs, 3, 2);
     }
 
-    // PhaseQ page: the nodes, rotation and mode on the right
-    {
-        auto page = area;
-        auto side = page.removeFromRight (200);
-        page.removeFromRight (16);
-        phaseQView.setBounds (page);
-        side.removeFromTop (24);
-        rotationKnob.label.setBounds (side.removeFromTop (20));
-        rotationKnob.knob.setBounds (side.removeFromTop (juce::jmin (180, side.getHeight() / 2)));
-        side.removeFromTop (20);
-        phaseModeLabel.setBounds (side.removeFromTop (20));
-        phaseModeBox.setBounds (side.removeFromTop (28).reduced (20, 0));
-    }
-
-    // Graphic EQ page
+    // PhaseQ and graphic EQ pages: the graph
+    phaseQView.setBounds (area);
     graphicEqView.setBounds (area);
 
     // Limiter page: history above, controls below

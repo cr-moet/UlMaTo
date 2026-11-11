@@ -7,9 +7,9 @@
 //==============================================================================
 // PhaseQ and graphic EQ: settings, their curves and the FIR stage that runs them.
 //
-// PhaseQ   - changes only the phase (the magnitude stays exactly flat): a global
-//            rotation plus six nodes, each a bump of phase over frequency with its own
-//            width; applied to both channels, mid, side, left or right.
+// PhaseQ   - changes only the phase (the magnitude stays exactly flat): up to twelve
+//            nodes, each on the left or right channel, a bell or a shelf of phase over
+//            frequency with its own Q.
 // Graphic  - six bands (low shelf, four bells, high shelf), linear phase: only the
 // EQ         magnitude changes.
 //==============================================================================
@@ -81,35 +81,52 @@ namespace Tone
     }
 
     //==========================================================================
-    enum PhaseMode { phaseStereo, phaseMid, phaseSide, phaseLeft, phaseRight };
-    inline const juce::StringArray phaseModeNames { "STEREO", "MID", "SIDE", "LEFT", "RIGHT" };
-    inline constexpr float phaseDefaultFreq[numBands] { 50.0f, 120.0f, 300.0f, 800.0f, 2500.0f, 7000.0f };
+    // PhaseQ: up to twelve nodes, each on the left or the right channel, bell or shelf
+    inline constexpr int numPhaseNodes = 12;
+    enum class PhaseShape { bell, shelf };
+
+    struct PhaseNode
+    {
+        bool on = false;
+        int channel = 0;                        // 0 left, 1 right
+        PhaseShape shape = PhaseShape::bell;
+        float freq = 1000.0f, amount = 0.0f, q = 1.0f;   // Hz, degrees, Q
+        bool operator== (const PhaseNode& o) const noexcept
+        {
+            return on == o.on && channel == o.channel && shape == o.shape && juce::exactlyEqual (freq, o.freq)
+                && juce::exactlyEqual (amount, o.amount) && juce::exactlyEqual (q, o.q);
+        }
+    };
 
     struct PhaseSettings
     {
-        Values freq {}, amount {}, width {};   // Hz, degrees, octaves
-        float rotation = 0.0f;                 // degrees
-        int mode = phaseStereo;
-        bool operator== (const PhaseSettings& o) const noexcept
-        {
-            return freq == o.freq && amount == o.amount && width == o.width && rotation == o.rotation && mode == o.mode;
-        }
+        std::array<PhaseNode, numPhaseNodes> node {};
+        bool valid = false;   // read from the parameters
+        bool operator== (const PhaseSettings& o) const noexcept   { return valid == o.valid && node == o.node; }
         bool operator!= (const PhaseSettings& o) const noexcept   { return ! (*this == o); }
     };
 
-    // Phase (radians) at f: rotation (faded in above 10 ... 30 Hz, DC must stay real) plus
-    // the nodes (a Gaussian bump over log frequency each), all faded out towards Nyquist
-    inline float phaseAt (const PhaseSettings& s, float f)
+    // Bandwidth in octaves of a node with quality q (as for a bell filter)
+    inline float octavesOfQ (float q)   { return 2.0f / std::log (2.0f) * std::asinh (1.0f / (2.0f * juce::jmax (0.05f, q))); }
+
+    // Phase (degrees) of one node at f: bell = Gaussian bump over log frequency as wide as
+    // the bandwidth of its Q; shelf = smooth step from 0 (below) to the amount (above)
+    inline float nodePhase (const PhaseNode& n, float f)
+    {
+        const float d = (std::log2 (juce::jmax (1.0f, f)) - std::log2 (n.freq)) / (0.5f * octavesOfQ (n.q));
+        return n.amount * (n.shape == PhaseShape::bell ? std::exp (-0.5f * d * d) : 0.5f * (1.0f + std::tanh (d)));
+    }
+
+    // Phase (radians) of one channel at f: sum of its nodes (only = just this node), faded
+    // in above 5 ... 15 Hz (DC must stay real) and out towards Nyquist
+    inline float phaseAt (const PhaseSettings& s, int channel, float f, int only = -1)
     {
         const auto ramp = [] (float x, float from, float to) { return juce::jlimit (0.0f, 1.0f, (x - from) / (to - from)); };
-        const float octave = std::log2 (juce::jmax (1.0f, f));
-        float degrees = s.rotation * ramp (octave, std::log2 (10.0f), std::log2 (30.0f));
-        for (size_t n = 0; n < (size_t) numBands; ++n)
-        {
-            const float d = (octave - std::log2 (s.freq[n])) / juce::jmax (0.05f, s.width[n] * 0.5f);
-            degrees += s.amount[n] * std::exp (-0.5f * d * d);
-        }
-        return juce::degreesToRadians (degrees) * (1.0f - ramp (f, 18000.0f, 21000.0f));
+        float degrees = 0.0f;
+        for (int i = 0; i < numPhaseNodes; ++i)
+            if (const auto& n = s.node[(size_t) i]; n.on && n.channel == channel && (only < 0 || only == i))
+                degrees += nodePhase (n, f);
+        return juce::degreesToRadians (degrees) * ramp (f, 5.0f, 15.0f) * (1.0f - ramp (f, 18000.0f, 21000.0f));
     }
 
     //==========================================================================
@@ -225,15 +242,6 @@ namespace Tone
 
     inline FirStage::Response phaseResponse (const PhaseSettings& s, float f)
     {
-        const auto h = std::polar (1.0f, phaseAt (s, f));
-        const std::complex<float> one (1.0f);
-        switch (s.mode)
-        {
-            case phaseMid:   return { 0.5f * (h + one), 0.5f * (h - one), 0.5f * (h - one), 0.5f * (h + one) };
-            case phaseSide:  return { 0.5f * (one + h), 0.5f * (one - h), 0.5f * (one - h), 0.5f * (one + h) };
-            case phaseLeft:  return { h, 0.0f, 0.0f, one };
-            case phaseRight: return { one, 0.0f, 0.0f, h };
-            default:         return { h, 0.0f, 0.0f, h };
-        }
+        return { std::polar (1.0f, phaseAt (s, 0, f)), 0.0f, 0.0f, std::polar (1.0f, phaseAt (s, 1, f)) };
     }
 }

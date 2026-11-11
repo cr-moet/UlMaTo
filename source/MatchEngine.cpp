@@ -704,7 +704,7 @@ void MatchEngine::updateDynamic (const Spectrum::Profile& ref, const Spectrum::P
 void MatchEngine::updateToneStages()
 {
     const auto phase = phaseShared.get();
-    if (phase.freq[0] > 0.0f && phase != designedPhase
+    if (phase.valid && phase != designedPhase
          && phaseFilter.update (sampleRate, [&phase] (float f) { return Tone::phaseResponse (phase, f); }))
         designedPhase = phase;
 

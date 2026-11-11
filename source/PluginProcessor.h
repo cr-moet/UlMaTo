@@ -24,12 +24,13 @@ namespace ParamIDs
     inline constexpr const char* eqGain[] { "eqGain1", "eqGain2", "eqGain3", "eqGain4", "eqGain5", "eqGain6" };
     inline constexpr const char* eqQ[]    { "eqQ1", "eqQ2", "eqQ3", "eqQ4", "eqQ5", "eqQ6" };
 
-    // PhaseQ: six nodes, rotation, mode
-    inline constexpr const char* phaseFreq[]   { "phaseFreq1", "phaseFreq2", "phaseFreq3", "phaseFreq4", "phaseFreq5", "phaseFreq6" };
-    inline constexpr const char* phaseAmount[] { "phaseAmount1", "phaseAmount2", "phaseAmount3", "phaseAmount4", "phaseAmount5", "phaseAmount6" };
-    inline constexpr const char* phaseWidth[]  { "phaseWidth1", "phaseWidth2", "phaseWidth3", "phaseWidth4", "phaseWidth5", "phaseWidth6" };
-    inline constexpr const char* phaseRotation = "phaseRotation";
-    inline constexpr const char* phaseMode     = "phaseMode";
+    // PhaseQ: twelve nodes (off until created), each left or right, bell or shelf
+    inline constexpr const char* phaseOn[12] { "phaseOn1", "phaseOn2", "phaseOn3", "phaseOn4", "phaseOn5", "phaseOn6", "phaseOn7", "phaseOn8", "phaseOn9", "phaseOn10", "phaseOn11", "phaseOn12" };
+    inline constexpr const char* phaseSide[12] { "phaseSide1", "phaseSide2", "phaseSide3", "phaseSide4", "phaseSide5", "phaseSide6", "phaseSide7", "phaseSide8", "phaseSide9", "phaseSide10", "phaseSide11", "phaseSide12" };
+    inline constexpr const char* phaseShape[12] { "phaseShape1", "phaseShape2", "phaseShape3", "phaseShape4", "phaseShape5", "phaseShape6", "phaseShape7", "phaseShape8", "phaseShape9", "phaseShape10", "phaseShape11", "phaseShape12" };
+    inline constexpr const char* phaseFreq[12] { "phaseFreq1", "phaseFreq2", "phaseFreq3", "phaseFreq4", "phaseFreq5", "phaseFreq6", "phaseFreq7", "phaseFreq8", "phaseFreq9", "phaseFreq10", "phaseFreq11", "phaseFreq12" };
+    inline constexpr const char* phaseAmount[12] { "phaseAmount1", "phaseAmount2", "phaseAmount3", "phaseAmount4", "phaseAmount5", "phaseAmount6", "phaseAmount7", "phaseAmount8", "phaseAmount9", "phaseAmount10", "phaseAmount11", "phaseAmount12" };
+    inline constexpr const char* phaseQ[12] { "phaseQ1", "phaseQ2", "phaseQ3", "phaseQ4", "phaseQ5", "phaseQ6", "phaseQ7", "phaseQ8", "phaseQ9", "phaseQ10", "phaseQ11", "phaseQ12" };
 
     // Limiter
     inline constexpr const char* limiterOn       = "limiterOn";
