@@ -76,6 +76,7 @@ public:
     float getLimiterReductionDb() const noexcept   { return limiter.getGainReductionDb(); }
     float getLimiterOutputDb() const noexcept      { return limiter.getOutputPeakDb(); }
     Limit::Meters getLimiterMeters() const noexcept   { return limiter.getMeters(); }
+    float getAnalogVuDb (int channel) const noexcept  { return analog.getVuDb (channel); }
     int readLimiterColumns (Limit::Column* destination, int maxCount) noexcept   { return limiter.readColumns (destination, maxCount); }
     void resetLimiterLoudness() noexcept           { limiter.resetLoudness(); }
 

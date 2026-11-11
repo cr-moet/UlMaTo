@@ -1068,3 +1068,220 @@ private:
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (Led)
 };
+
+//==============================================================================
+// Analog VU meter with a needle, set square into the front: dark face lit from behind in
+// warm orange, printed scale -20 ... +5 VU (linear in voltage, as on the real meter) with
+// the red zone above 0 and a per cent scale below; 0 VU = -18 dBFS (RMS of a sine). The needle is a damped mass on
+// a spring: ~300 ms to the reading with a small overshoot, like the VU standard.
+class VuMeter final : public juce::Component,
+                      private juce::Timer
+{
+public:
+    VuMeter (juce::String channelName, std::function<float()> levelDb) : name (std::move (channelName)), source (std::move (levelDb))
+    {
+        startTimerHz (60);
+    }
+
+    void paint (juce::Graphics& g) override
+    {
+        const auto outer = getLocalBounds().toFloat().reduced (2.0f);
+        const auto face = outer.reduced (juce::jmax (5.0f, outer.getWidth() * 0.028f));
+        const juce::Colour cream (0xffeed3a2), red (0xffe8603c), dark (0xff17100b);
+
+        // Thin black frame around the whole meter, with the grain of moulded plastic
+        g.setColour (juce::Colours::black.withAlpha (0.3f));
+        g.fillRect (outer.translated (1.5f, 2.0f));
+        g.setColour (juce::Colour (0xff1b1b1b));
+        g.fillRect (outer);
+        {
+            juce::Graphics::ScopedSaveState frame (g);
+            juce::RectangleList<int> ring (outer.toNearestInt());
+            ring.subtract (face.toNearestInt());
+            g.reduceClipRegion (ring);
+            const auto& grain = UlMaToLookAndFeel::stippleTexture();
+            for (float y = outer.getY(); y < outer.getBottom(); y += (float) grain.getHeight() * 0.6f)
+                for (float x = outer.getX(); x < outer.getRight(); x += (float) grain.getWidth() * 0.6f)
+                    g.drawImageTransformed (grain, juce::AffineTransform::scale (0.6f).translated (x, y));
+        }
+        g.setColour (juce::Colours::white.withAlpha (0.16f));   // edges of the frame: lit top / left
+        g.drawLine (outer.getX(), outer.getY() + 0.5f, outer.getRight(), outer.getY() + 0.5f, 1.0f);
+        g.drawLine (outer.getX() + 0.5f, outer.getY(), outer.getX() + 0.5f, outer.getBottom(), 1.0f);
+        g.setColour (juce::Colours::black);
+        g.drawRect (face.expanded (1.0f), 1.0f);
+
+        // Square cut-out in the panel: dark face lit from behind with a warm orange glow
+        g.setColour (dark);
+        g.fillRect (face);
+        // Two lamps below the scale, left and right of the needle, light the face from below
+        const auto lamps = [&] (float alpha)
+        {
+            for (float side : { -1.0f, 1.0f })
+            {
+                const auto lamp = juce::Point<float> (face.getCentreX() + side * face.getWidth() * 0.24f, face.getBottom() - face.getHeight() * 0.08f);
+                juce::ColourGradient light (juce::Colour (0xffffa848).withAlpha (0.55f * alpha), lamp.x, lamp.y,
+                                            juce::Colour (0xffff8a2a).withAlpha (0.0f), lamp.x + face.getHeight() * 0.85f, lamp.y, true);
+                light.addColour (0.35, juce::Colour (0xffe8721e).withAlpha (0.3f * alpha));
+                g.setGradientFill (light);
+                g.fillRect (face);
+            }
+        };
+        lamps (1.0f);
+
+        // Scale: arcs around a pivot below the face
+        const float spread = juce::degreesToRadians (48.0f);
+        const float radius = juce::jmin (face.getHeight() * 0.95f, face.getWidth() * 0.335f / std::sin (spread));
+        // Vertical layout: the same space above the numbers as between "VU" and the cover
+        const float margin = face.getHeight() * 0.07f, coverHeight = face.getHeight() * 0.11f;
+        const float topOfNumbers = radius + face.getHeight() * 0.09f + face.getHeight() * 0.075f + 8.0f;   // from the pivot
+        const auto pivot = juce::Point<float> (face.getCentreX(), face.getY() + margin + topOfNumbers);
+        const auto angleOf = [spread] (float position) { return -spread + 2.0f * spread * position; };
+        const auto at = [&] (float angle, float rr) { return pivot + juce::Point<float> (std::sin (angle), -std::cos (angle)) * rr; };
+        const float band = 1.2f, tick = face.getHeight() * 0.09f;
+        const float vuHeight = face.getHeight() * 0.17f;
+
+        juce::Graphics::ScopedSaveState state (g);
+        g.reduceClipRegion (face.toNearestInt());
+        const auto glowing = [&g] (const juce::Path& path, juce::Colour colour)   // printed scale, lit from behind
+        {
+            g.setColour (colour.withAlpha (0.15f));
+            g.strokePath (path, juce::PathStrokeType (1.5f));
+            g.setColour (colour);
+            g.fillPath (path);
+        };
+        const auto arcBand = [&] (float from, float to, float rr, float width)
+        {
+            juce::Path p;
+            p.addCentredArc (pivot.x, pivot.y, rr, rr, 0.0f, angleOf (from), angleOf (to), true);
+            juce::Path stroke;
+            juce::PathStrokeType (width, juce::PathStrokeType::mitered, juce::PathStrokeType::butt).createStrokedPath (stroke, p);
+            return stroke;
+        };
+        const auto tickLine = [&] (float position, float from, float to, float width)   // a straight, thin tick
+        {
+            const float a = angleOf (position);
+            juce::Path line, p;
+            line.startNewSubPath (at (a, from));
+            line.lineTo (at (a, to));
+            juce::PathStrokeType (width).createStrokedPath (p, line);
+            return p;
+        };
+
+        // Main scale: cream up to 0, a small gap, then the red zone up to +5, only broken at
+        // +3 (a gap as wide as the needle); ticks: the cream ones (one at 0), a red one where
+        // the red zone begins and one at +5 - the red ones start at the lower edge of the red
+        // band; the red 0 stands above the cream and the red tick at 0
+        const float zero = positionOf (0.0f), gap = 0.025f, redLow = radius + 1.5f - 1.75f;
+        const float needleGap = 2.2f / (radius * 2.0f * spread);   // the width of the needle, in scale units
+        const float three = positionOf (3.0f);
+        glowing (arcBand (0.0f, zero, radius, band), cream);
+        glowing (arcBand (zero + gap, three - needleGap * 0.5f, radius + 1.5f, 3.5f), red);
+        glowing (arcBand (three + needleGap * 0.5f, 1.0f, radius + 1.5f, 3.5f), red);
+
+        const float numberSize = juce::jlimit (9.0f, 15.0f, face.getHeight() * 0.11f), numberRadius = radius + tick + face.getHeight() * 0.075f;
+        const auto number = [&] (const juce::String& text, float position, juce::Colour colour, float shift = 0.0f)
+        {
+            g.setColour (colour);
+            g.setFont (juce::Font (juce::FontOptions (numberSize)));
+            g.drawText (text, juce::Rectangle<float> (30.0f, 16.0f).withCentre (at (angleOf (position), numberRadius).translated (shift, 0.0f)), juce::Justification::centred);
+        };
+        // 20 and 5 at the same distance from the edge: the wider 20 moves in by half the difference
+        const float endShift = 0.5f * (juce::GlyphArrangement::getStringWidth (juce::Font (juce::FontOptions (numberSize)), "20")
+                                     - juce::GlyphArrangement::getStringWidth (juce::Font (juce::FontOptions (numberSize)), "5"));
+        for (float vu : { -20.0f, -10.0f, -7.0f, -5.0f, -3.0f, -2.0f, -1.0f, 0.0f })
+        {
+            const float pos = positionOf (vu);
+            const bool major = vu == -20.0f || vu == -10.0f || vu == -5.0f || vu == 0.0f;
+            glowing (tickLine (pos, radius, radius + (major ? tick : tick * 0.65f), major ? 1.5f : 1.0f), cream);
+            if (vu < 0.0f)
+                number (juce::String ((int) -vu), pos, cream, vu == -20.0f ? endShift : 0.0f);
+        }
+        glowing (tickLine (zero + gap, redLow, radius + tick, 1.5f), red);
+        glowing (tickLine (1.0f, redLow, radius + tick, 1.5f), red);
+        number ("0", zero + gap * 0.5f, red);
+        number ("3", three, red);
+        number ("5", 1.0f, red);
+
+        // + and - at the ends, below the scale
+        g.setFont (juce::Font (juce::FontOptions (juce::jlimit (10.0f, 18.0f, face.getHeight() * 0.13f))));
+        g.setColour (red);
+        g.drawText ("+", juce::Rectangle<float> (20.0f, 20.0f).withCentre (at (angleOf (1.0f) + 0.08f, radius - face.getHeight() * 0.1f)), juce::Justification::centred);
+        g.setColour (cream);
+        g.drawText (juce::String (juce::CharPointer_UTF8 ("\xe2\x88\x92")), juce::Rectangle<float> (20.0f, 20.0f).withCentre (at (angleOf (0.0f) - 0.08f, radius - face.getHeight() * 0.1f)),
+                    juce::Justification::centred);
+
+        // Second scale just below: per cent of the 0 VU voltage, over the whole width
+        const float inner = radius - face.getHeight() * 0.055f;
+        glowing (arcBand (0.0f, 1.0f, inner, 1.0f), cream);
+        g.setColour (cream);
+        g.setFont (juce::Font (juce::FontOptions (juce::jlimit (8.0f, 13.0f, face.getHeight() * 0.09f))));
+        for (float percent : { 30.0f, 50.0f, 70.0f, 100.0f })
+            g.drawText (juce::String ((int) percent), juce::Rectangle<float> (30.0f, 14.0f).withCentre (at (angleOf (positionOf (20.0f * std::log10 (percent / 100.0f))), inner - face.getHeight() * 0.075f)),
+                        juce::Justification::centred);
+        g.setColour (red);
+        g.fillEllipse (juce::Rectangle<float> (5.0f, 5.0f).withCentre (at (angleOf (zero) + 0.25f, inner - face.getHeight() * 0.075f)));
+
+        g.setColour (cream.withAlpha (0.9f));
+        g.setFont (juce::Font (juce::FontOptions (vuHeight, juce::Font::bold)));
+        g.drawText ("VU", juce::Rectangle<float> (face.getWidth() * 0.4f, vuHeight).withCentre ({ face.getCentreX(), face.getBottom() - coverHeight - margin - vuHeight * 0.4f }),
+                    juce::Justification::centred);
+        g.setFont (juce::Font (juce::FontOptions (11.0f, juce::Font::bold)));
+        g.drawText (name, face.reduced (8.0f, 4.0f).withTrimmedBottom (face.getHeight() * 0.12f), juce::Justification::bottomLeft);
+
+        lamps (0.35f);   // the lamps also light the printed scale
+
+        // Needle: light, with its shadow on the face; the pivot under a dark cover
+        const float a = angleOf (needle);
+        g.setColour (juce::Colours::black.withAlpha (0.45f));
+        g.drawLine ({ at (a, 0.0f).translated (3.0f, 2.0f), at (a, radius + tick).translated (3.0f, 2.0f) }, 2.0f);
+        g.setColour (juce::Colour (0xfff6e6c8));
+        g.drawLine ({ at (a, 0.0f), at (a, radius + tick) }, 1.8f);
+        const auto cover = face.withTop (face.getBottom() - coverHeight);
+        g.setGradientFill (juce::ColourGradient (juce::Colour (0xff3a3632), cover.getX(), cover.getY(), juce::Colour (0xff1c1a18), cover.getX(), cover.getBottom(), false));
+        g.fillRect (cover);
+        g.setColour (juce::Colours::white.withAlpha (0.12f));
+        g.drawHorizontalLine ((int) cover.getY(), cover.getX(), cover.getRight());
+
+        // Glass and the cut-out: a faint reflection, inner shadow at the top and left, edges
+        g.setColour (juce::Colours::white.withAlpha (0.05f));
+        g.fillRect (face.withHeight (face.getHeight() * 0.3f));
+        const auto shade = [&g] (juce::Rectangle<float> r, juce::Point<float> from, juce::Point<float> to)
+        {
+            g.setGradientFill (juce::ColourGradient (juce::Colours::black.withAlpha (0.7f), from, juce::Colours::transparentBlack, to, false));
+            g.fillRect (r);
+        };
+        shade (face.withHeight (12.0f), face.getTopLeft(), face.getTopLeft().translated (0.0f, 12.0f));
+        shade (face.withWidth (8.0f), face.getTopLeft(), face.getTopLeft().translated (8.0f, 0.0f));
+    }
+
+private:
+    // Needle position 0 ... 1 for a VU reading: linear in voltage, -20 ... 0 VU over the first
+    // 72 % of the scale, 0 ... +5 VU over the rest
+    static float positionOf (float vu)
+    {
+        constexpr float zeroAt = 0.72f;
+        const float v = std::pow (10.0f, juce::jlimit (-30.0f, 6.0f, vu) / 20.0f);
+        const float lo = std::pow (10.0f, -20.0f / 20.0f), hi = std::pow (10.0f, 5.0f / 20.0f);
+        return v <= 1.0f ? zeroAt * (v - lo) / (1.0f - lo) : zeroAt + (1.0f - zeroAt) * (v - 1.0f) / (hi - 1.0f);
+    }
+
+    void timerCallback() override
+    {
+        const float target = juce::jlimit (-0.03f, 1.06f, positionOf (source() + 18.0f));
+        constexpr float omega = 19.0f, damping = 0.82f, dt = 1.0f / 240.0f;
+        for (int i = 0; i < 4; ++i)   // a mass on a spring, 4 steps per frame
+        {
+            velocity += dt * (omega * omega * (target - needle) - 2.0f * damping * omega * velocity);
+            needle += dt * velocity;
+        }
+        needle = juce::jlimit (-0.03f, 1.06f, needle);   // the end stops
+        if (isShowing())
+            repaint();
+    }
+
+    juce::String name;
+    std::function<float()> source;
+    float needle = 0.0f, velocity = 0.0f;
+
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (VuMeter)
+};

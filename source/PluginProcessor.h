@@ -18,6 +18,9 @@ namespace ParamIDs
     inline constexpr const char* flutterDepth = "flutterDepth";
     inline constexpr const char* flutterRate  = "flutterRate";
     inline constexpr const char* crackle     = "crackle";
+    inline constexpr const char* hum         = "hum";
+    inline constexpr const char* hum60       = "hum60";        // mains hum 60 Hz (off: 50 Hz)
+    inline constexpr const char* analogDrive = "analogDrive";  // dB into the analog heat, taken back after it
     inline constexpr const char* tube        = "tube";
     inline constexpr const char* transformer = "transformer";
 
@@ -143,6 +146,7 @@ public:
     float getLimiterReductionDb() const noexcept           { return engine.getLimiterReductionDb(); }
     float getLimiterOutputDb() const noexcept              { return engine.getLimiterOutputDb(); }
     Limit::Meters getLimiterMeters() const noexcept        { return engine.getLimiterMeters(); }
+    float getAnalogVuDb (int channel) const noexcept        { return engine.getAnalogVuDb (channel); }
     int readLimiterColumns (Limit::Column* destination, int maxCount) noexcept   { return engine.readLimiterColumns (destination, maxCount); }
     void resetLimiterLoudness() noexcept                   { engine.resetLimiterLoudness(); }
 
@@ -168,6 +172,9 @@ private:
     std::atomic<float>* flutterDepthParam = nullptr;
     std::atomic<float>* flutterRateParam = nullptr;
     std::atomic<float>* crackleParam = nullptr;
+    std::atomic<float>* humParam = nullptr;
+    std::atomic<float>* hum60Param = nullptr;
+    std::atomic<float>* driveParam = nullptr;
     std::atomic<float>* tubeParam = nullptr;
     std::atomic<float>* transformerParam = nullptr;
 

@@ -78,6 +78,9 @@ UlMaToProcessor::UlMaToProcessor()
     flutterDepthParam = apvts.getRawParameterValue (ParamIDs::flutterDepth);
     flutterRateParam  = apvts.getRawParameterValue (ParamIDs::flutterRate);
     crackleParam     = apvts.getRawParameterValue (ParamIDs::crackle);
+    humParam         = apvts.getRawParameterValue (ParamIDs::hum);
+    hum60Param       = apvts.getRawParameterValue (ParamIDs::hum60);
+    driveParam       = apvts.getRawParameterValue (ParamIDs::analogDrive);
     tubeParam        = apvts.getRawParameterValue (ParamIDs::tube);
     transformerParam = apvts.getRawParameterValue (ParamIDs::transformer);
 }
@@ -135,6 +138,12 @@ juce::AudioProcessorValueTreeState::ParameterLayout UlMaToProcessor::createParam
                                                                  juce::AudioParameterFloatAttributes().withLabel ("Hz").withStringFromValueFunction (rateText)));
     }
     addPercent (ParamIDs::crackle,     "Vinyl Crackle", 0.0f);
+    addPercent (ParamIDs::hum,         "Vinyl Hum", 0.0f);
+    layout.add (std::make_unique<juce::AudioParameterBool> (juce::ParameterID { ParamIDs::hum60, 1 }, "Vinyl Hum 60 Hz", false));
+    layout.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { ParamIDs::analogDrive, 1 }, "Analog Drive",
+                                                             juce::NormalisableRange<float> (0.0f, 24.0f, 0.1f), 0.0f,
+                                                             juce::AudioParameterFloatAttributes().withLabel ("dB")
+                                                                 .withStringFromValueFunction ([] (float v, int) { return "+" + juce::String (v, 1) + " dB"; })));
     addPercent (ParamIDs::tube,        "Tube",        0.0f);
     addPercent (ParamIDs::transformer, "Transformer", 0.0f);
 
@@ -299,6 +308,9 @@ MatchEngine::StageSettings UlMaToProcessor::readStageSettings() const
     s.analog.wowRate      = wowRateParam->load();
     s.analog.flutterRate  = flutterRateParam->load();
     s.analog.crackle     = crackleParam->load() * 0.01f;
+    s.analog.hum         = humParam->load() * 0.01f;
+    s.analog.hum60       = hum60Param->load() > 0.5f;
+    s.analog.driveDb     = driveParam->load();
     s.analog.tube        = tubeParam->load() * 0.01f;
     s.analog.transformer = transformerParam->load() * 0.01f;
 

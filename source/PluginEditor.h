@@ -7,7 +7,8 @@
 // LEARN), tabs (in processing order, can be dragged), then one page per stage:
 //  EQ MATCH    - the three analysis displays, the output spectrum, MATCH / RESPONSE
 //  DYNAMICS    - level distributions per band, DYNAMICS knob
-//  ANALOG HEAT - tape saturation per band, wow, flutter, crackle, tube, transformer
+//  ANALOG HEAT - tape heat (drive, saturation per band, wow, flutter), vinyl (crackle, hum),
+//                output stages (tube, transformer), VU meters
 //  PHASEQ      - left and right in one graph, nodes created by double-click
 //  GRAPHIC EQ  - six band nodes
 //  LIMITER     - scrolling history and meters; gain, output, lookahead, attack, release, links,
@@ -70,8 +71,12 @@ private:
         std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> attachment;
     };
     std::array<LabelledKnob, Dynamics::numBands> tapeKnobs;
-    std::array<LabelledKnob, 7> heatKnobs;   // wow depth / rate, flutter depth / rate, crackle, tube, transformer
-    juce::Rectangle<int> tapePanel, transportPanel, outputPanel;
+    std::array<LabelledKnob, 8> heatKnobs;   // wow depth / rate, flutter depth / rate, crackle, hum, tube, transformer
+    LabelledKnob driveKnob;
+    juce::TextButton humFrequencyButton;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> humFrequencyAttachment;
+    VuMeter vuLeft { "L", [this] { return processorRef.getAnalogVuDb (0); } }, vuRight { "R", [this] { return processorRef.getAnalogVuDb (1); } };
+    juce::Rectangle<int> tapePanel, vinylPanel, outputPanel, vuPanel;
     std::vector<std::pair<int, juce::Rectangle<int>>> controlPanels;   // page, raised screwed panel around its controls
 
     // PhaseQ, graphic EQ, limiter pages

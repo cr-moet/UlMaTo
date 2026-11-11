@@ -4,11 +4,14 @@
 
 //==============================================================================
 // Analog heat: the colour of analog gear, in this order
+//   0. DRIVE: the level into the whole chain; after the output stages it is taken back
+//      again (automatic gain staging), so the drive only changes how hard everything works,
 //   1. tape transport as described for the Abbey Road J37: wow is a slow movement of the
 //      pitch (speed of the motor, a modulated delay), flutter a fast movement of the level
 //      (the tape moving against the heads); each with depth and rate around the reference
 //      of the machine,
-//   2. vinyl crackle: clicks and the odd pop, each at its own place in the stereo field,
+//   2. vinyl crackle: clicks and the odd pop, each at its own place in the stereo field;
+//      vinyl hum: mains hum (50 or 60 Hz) with the buzz of its harmonics,
 //   3. (2x oversampled from here on)
 //      tape saturation per band (the five bands of the dynamics), warm and asymmetric,
 //      tube output stage: asymmetric (even harmonics),
@@ -28,11 +31,13 @@ namespace Analog
         Dynamics::Values tape {};   // 0 ... 1 per band
         float wowDepth = 0.0f, flutterDepth = 0.0f;           // 0 (off) ... 1 (full)
         float wowRate = 0.8f, flutterRate = 5.15f;            // Hz
-        float crackle = 0.0f, tube = 0.0f, transformer = 0.0f;
+        float crackle = 0.0f, hum = 0.0f, tube = 0.0f, transformer = 0.0f;
+        float driveDb = 0.0f;
+        bool hum60 = false;   // mains hum at 60 Hz (else 50 Hz)
 
         bool isActive() const noexcept
         {
-            bool any = wowDepth > 0.0f || flutterDepth > 0.0f || crackle > 0.0f || tube > 0.0f || transformer > 0.0f;
+            bool any = driveDb > 0.0f || wowDepth > 0.0f || flutterDepth > 0.0f || crackle > 0.0f || hum > 0.0f || tube > 0.0f || transformer > 0.0f;
             for (auto t : tape)
                 any = any || t > 0.0f;
             return any;
@@ -67,6 +72,8 @@ namespace Analog
             levelCoefficient  = window (0.3f);
             makeUpCoefficient = window (0.5f);
             crackleHighpass = std::exp (-juce::MathConstants<float>::twoPi * 900.0f / (float) sampleRate);
+            vuCoefficient = 1.0f - std::exp (-1.0f / (float) (sampleRate * 0.065));   // the needle adds the rest of the 300 ms
+            driveGain.reset (sampleRate, 0.05);
             reset();
         }
 
@@ -92,9 +99,16 @@ namespace Analog
             tubeHarmonics.fill ({});
             transformerHarmonics.fill ({});
             fade = 0.0f;
+            humPhase = 0.0;
+            humAmount = humWander = 0.0f;
+            vuState = {};
+            driveGain.setCurrentAndTargetValue (driveGain.getTargetValue());
         }
 
         int getLatencySamples() const noexcept   { return latency; }
+
+        // VU level of the output (average of the rectified signal, 300 ms), dBFS per channel
+        float getVuDb (int channel) const noexcept   { return vu[(size_t) channel].load (std::memory_order_relaxed); }
 
         // In place, numSamples <= maxBlockSize
         void process (float* left, float* right, int numSamples, const Settings& s) noexcept
@@ -105,6 +119,17 @@ namespace Analog
             const int dryLength = dry.getNumSamples();
 
             const bool active = s.isActive();
+            const auto measure = [&]
+            {
+                for (size_t c = 0; c < 2; ++c)
+                {
+                    const float* x = c == 0 ? left : right;
+                    for (int i = 0; i < numSamples; ++i)
+                        vuState[c] += vuCoefficient * (std::abs (x[i]) - vuState[c]);
+                    // the average of a rectified sine is 2 / pi of its peak: times pi / (2 sqrt 2) it reads as its RMS
+                    vu[c].store (juce::Decibels::gainToDecibels (vuState[c] * 1.1107f, -100.0f), std::memory_order_relaxed);
+                }
+            };
             if (! active && fade <= 0.0f)
             {
                 // Off: only the delay (the stages keep their state from silence)
@@ -117,16 +142,21 @@ namespace Analog
                     right[i] = dryR[read];
                     dryPosition = read;
                 }
+                measure();
                 return;
             }
 
             float* inL = input.getWritePointer (0);
             float* inR = input.getWritePointer (1);
+            driveGain.setTargetValue (juce::Decibels::decibelsToGain (s.driveDb));
             for (int i = 0; i < numSamples; ++i)
             {
                 inL[i] = left[i];
                 inR[i] = right[i];
-                transportAndCrackle (left[i], right[i], s);
+                driveNow[(size_t) i] = driveGain.getNextValue();
+                left[i]  *= driveNow[(size_t) i];
+                right[i] *= driveNow[(size_t) i];
+                transportAndCrackle (left[i], right[i], s, driveNow[(size_t) i]);
             }
 
             // Saturation, 2x oversampled
@@ -135,6 +165,11 @@ namespace Analog
             auto up = oversampling.processSamplesUp (block);
             saturate (up.getChannelPointer (0), up.getChannelPointer (1), (int) up.getNumSamples(), s);
             oversampling.processSamplesDown (block);
+            for (int i = 0; i < numSamples; ++i)   // gain staging: the drive taken back after the output stages
+            {
+                left[i]  /= driveNow[(size_t) i];
+                right[i] /= driveNow[(size_t) i];
+            }
 
             // Cross-fade with the dry signal (both have the same latency)
             for (int i = 0; i < numSamples; ++i)
@@ -147,6 +182,7 @@ namespace Analog
                 right[i] = dryR[read] + fade * (right[i] - dryR[read]);
                 dryPosition = read;
             }
+            measure();
         }
 
     private:
@@ -160,7 +196,7 @@ namespace Analog
         }
 
         // Wow / flutter (one transport for both channels) and vinyl crackle, at the base rate
-        void transportAndCrackle (float& l, float& r, const Settings& s) noexcept
+        void transportAndCrackle (float& l, float& r, const Settings& s, float drive) noexcept
         {
             const int length = transport.getNumSamples();
             float* tl = transport.getWritePointer (0);
@@ -231,8 +267,24 @@ namespace Analog
                     crackleState[c] = crackleHighpass * (crackleState[c] + noise - crackleLast[c]);   // one-pole highpass
                     crackleLast[c] = noise;
                 }
-                l += crackleState[0];
-                r += crackleState[1];
+                l += crackleState[0] * drive;   // times the drive: after the gain staging it is as loud as set
+                r += crackleState[1] * drive;
+            }
+
+            // Vinyl hum: the mains frequency with its harmonics (the buzz of the rectifier),
+            // full: -30 dBFS for the fundamental; slowly wandering a little in level
+            humAmount += (float) (20.0 / sampleRate) * (s.hum - humAmount);
+            if (humAmount > 1.0e-5f)
+            {
+                humPhase = std::fmod (humPhase + juce::MathConstants<double>::twoPi * (s.hum60 ? 60.0 : 50.0) / sampleRate, juce::MathConstants<double>::twoPi);
+                humWander += (random() - humWander) * (float) (0.5 / sampleRate);
+                static constexpr float harmonics[] { 1.0f, 0.45f, 0.3f, 0.12f, 0.08f, 0.05f, 0.03f };
+                float h = 0.0f;
+                for (int k = 0; k < 7; ++k)
+                    h += harmonics[k] * (float) std::sin ((k + 1) * humPhase + 0.4 * k);
+                h *= 0.0316f * humAmount * humAmount * (1.0f + 0.15f * humWander) * drive;
+                l += h;
+                r += h;
             }
         }
 
@@ -261,7 +313,7 @@ namespace Analog
             for (size_t b = 0; b < (size_t) Dynamics::numBands; ++b)
             {
                 const float amount = s.tape[b] * tapeScale[b];
-                tapeDrive[b]  = juce::Decibels::decibelsToGain (amount * 12.0f);   // up to +12 dB into the tape
+                tapeDrive[b]  = juce::Decibels::decibelsToGain (amount * 24.0f);   // up to +24 dB into the tape (a band only carries part of the level)
                 tapeSpread[b] = 0.06f * amount;                                   // random L/R drive variation
                 tapeOn = tapeOn || s.tape[b] > 0.0f;
             }
@@ -343,6 +395,12 @@ namespace Analog
 
         std::array<float, 2> crackleEnv {}, crackleState {}, crackleLast {}, dcIn {}, dcOut {}, core {}, powerIn {}, powerOut {}, makeUp {};
         float crackleDecay = 0.0f, crackleHighpass = 0.0f, dcCoefficient = 0.0f, coreCoefficient = 0.0f;
+        double humPhase = 0.0;
+        float humAmount = 0.0f, humWander = 0.0f, vuCoefficient = 0.0f;
+        juce::SmoothedValue<float, juce::ValueSmoothingTypes::Multiplicative> driveGain { 1.0f };
+        std::array<float, 8192> driveNow {};
+        std::array<float, 2> vuState {};
+        std::array<std::atomic<float>, 2> vu { -100.0f, -100.0f };
         std::array<std::array<Harmonics, Dynamics::numBands>, 2> tapeHarmonics;
         std::array<Harmonics, 2> tubeHarmonics, transformerHarmonics;
         Dynamics::Values bandCoefficient {};

@@ -106,9 +106,23 @@ UlMaToEditor::UlMaToEditor (UlMaToProcessor& p)
     setUpKnob (heatKnobs[1], ParamIDs::wowRate,      "WOW RATE");
     setUpKnob (heatKnobs[2], ParamIDs::flutterDepth, "FLUTTER DEPTH");
     setUpKnob (heatKnobs[3], ParamIDs::flutterRate,  "FLUTTER RATE");
-    setUpKnob (heatKnobs[4], ParamIDs::crackle,      "VINYL CRACKLE");
-    setUpKnob (heatKnobs[5], ParamIDs::tube,         "TUBE STAGE");
-    setUpKnob (heatKnobs[6], ParamIDs::transformer,  "TRANSFORMER");
+    setUpKnob (heatKnobs[4], ParamIDs::crackle,      "CRACKLE");
+    setUpKnob (heatKnobs[5], ParamIDs::hum,          "HUM");
+    setUpKnob (heatKnobs[6], ParamIDs::tube,         "TUBE STAGE");
+    setUpKnob (heatKnobs[7], ParamIDs::transformer,  "TRANSFORMER");
+    setUpKnob (driveKnob, ParamIDs::analogDrive, "DRIVE");
+    for (size_t i = 0; i < 4; ++i)
+        heatKnobs[i].label.setFont (juce::Font (juce::FontOptions (11.0f, juce::Font::bold)));
+    humFrequencyButton.setClickingTogglesState (true);
+    humFrequencyAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (processorRef.apvts, ParamIDs::hum60, humFrequencyButton);
+    humFrequencyButton.onStateChange = [this] { humFrequencyButton.setButtonText (humFrequencyButton.getToggleState() ? "60 HZ" : "50 HZ"); };
+    humFrequencyButton.onStateChange();
+    humFrequencyButton.setTooltip ("Mains frequency of the hum: 50 Hz (Europe) or 60 Hz (America)");
+    for (auto* c : std::initializer_list<juce::Component*> { &humFrequencyButton, &vuLeft, &vuRight })
+    {
+        addChildComponent (c);
+        pages[MatchEngine::analogStage].push_back (c);
+    }
     for (auto& k : tapeKnobs)
         k.label.setFont (juce::Font (juce::FontOptions (12.0f, juce::Font::bold)));
 
@@ -293,9 +307,10 @@ void UlMaToEditor::paint (juce::Graphics& g)
 
     // Analog heat: titles of the three groups (right of the upper left screw)
     if (currentPage == MatchEngine::analogStage)
-        for (auto [r, title] : { std::pair { tapePanel, "TAPE SATURATION PER BAND  (stereo: random drive per sample, left and right)" },
-                                 std::pair { transportPanel, "TAPE TRANSPORT (WOW: PITCH, FLUTTER: LEVEL) / VINYL" },
-                                 std::pair { outputPanel, "OUTPUT STAGES" } })
+        for (auto [r, title] : { std::pair { tapePanel, "TAPE HEAT  (drive through the whole page, taken back after the output stages; saturation per band; wow: pitch, flutter: level)" },
+                                 std::pair { vinylPanel, "VINYL" },
+                                 std::pair { outputPanel, "OUTPUT STAGES" },
+                                 std::pair { vuPanel, "VU  (0 VU = -18 dBFS)" } })
         {
             g.setColour (Colours::text);
             g.setFont (juce::Font (juce::FontOptions (12.0f, juce::Font::bold)));
@@ -336,31 +351,59 @@ void UlMaToEditor::resized()
         return r.reduced (padding);
     };
 
-    // Analog heat page: tape knobs in a row, below transport / vinyl and the output stages
+    // Analog heat page: tape heat above (drive, bands, wow / flutter small), below vinyl,
+    // the output stages and the VU meters
     {
         auto page = area;
         tapePanel = page.removeFromTop (page.getHeight() / 2 - 6);
         page.removeFromTop (12);
-        transportPanel = page.removeFromLeft (page.getWidth() * 5 / 7 - 6);
+        vinylPanel = page.removeFromLeft (270);
         page.removeFromLeft (12);
-        outputPanel = page;
-        for (auto r : { tapePanel, transportPanel, outputPanel })
+        outputPanel = page.removeFromLeft (250);
+        page.removeFromLeft (12);
+        vuPanel = page;   // the rest: the widest of the lower panels
+        for (auto r : { tapePanel, vinylPanel, outputPanel, vuPanel })
             panel (MatchEngine::analogStage, r, 0);
 
-        const auto placeRow = [] (juce::Rectangle<int> r, auto& knobs, size_t first, size_t count)
+        const auto place = [] (LabelledKnob& k, juce::Rectangle<int> cell, int labelHeight, int maxSize)
         {
-            r = r.reduced (24, 12).withTrimmedTop (20);
-            const int w = r.getWidth() / (int) count;
-            for (size_t i = first; i < first + count; ++i)
-            {
-                auto cell = r.removeFromLeft (w);
-                knobs[i].label.setBounds (cell.removeFromTop (32));
-                knobs[i].knob.setBounds (cell.withSizeKeepingCentre (juce::jmin (cell.getWidth(), 150), juce::jmin (cell.getHeight(), 150)));
-            }
+            k.label.setBounds (cell.removeFromTop (labelHeight));
+            k.knob.setBounds (cell.withSizeKeepingCentre (juce::jmin (cell.getWidth(), maxSize), juce::jmin (cell.getHeight(), maxSize)));
         };
-        placeRow (tapePanel, tapeKnobs, 0, tapeKnobs.size());
-        placeRow (transportPanel, heatKnobs, 0, 5);
-        placeRow (outputPanel, heatKnobs, 5, 2);
+        const auto inner = [] (juce::Rectangle<int> r) { return r.reduced (24, 12).withTrimmedTop (20); };
+
+        auto tape = inner (tapePanel);
+        place (driveKnob, tape.removeFromLeft (150), 32, 150);
+        tape.removeFromLeft (10);
+        auto small = tape.removeFromRight (220);   // wow / flutter: 2 x 2 small knobs
+        tape.removeFromRight (10);
+        const int bandWidth = tape.getWidth() / (int) tapeKnobs.size();
+        for (auto& k : tapeKnobs)
+            place (k, tape.removeFromLeft (bandWidth), 32, 130);
+        auto smallTop = small.removeFromTop (small.getHeight() / 2);
+        for (size_t i = 0; i < 4; ++i)
+        {
+            auto& rowArea = i < 2 ? smallTop : small;
+            place (heatKnobs[i], rowArea.removeFromLeft (110), 16, 82);
+        }
+
+        auto vinyl = inner (vinylPanel);
+        humFrequencyButton.setBounds (vinyl.removeFromBottom (30).withSizeKeepingCentre (90, 28).translated (vinyl.getWidth() / 4, 0));
+        vinyl.removeFromBottom (4);
+        const int vw = vinyl.getWidth() / 2;
+        place (heatKnobs[4], vinyl.removeFromLeft (vw), 22, 120);
+        place (heatKnobs[5], vinyl, 22, 120);
+
+        auto output = inner (outputPanel);
+        const int ow = output.getWidth() / 2;
+        place (heatKnobs[6], output.removeFromLeft (ow), 22, 130);
+        place (heatKnobs[7], output, 22, 130);
+
+        auto vu = inner (vuPanel).withTrimmedBottom (-4);
+        const int meterWidth = juce::jmin ((vu.getWidth() - 14) / 2, vu.getHeight() * 3 / 2);
+        auto meters = vu.withSizeKeepingCentre (meterWidth * 2 + 14, juce::jmin (vu.getHeight(), meterWidth * 2 / 3 + 6));
+        vuLeft.setBounds (meters.removeFromLeft (meterWidth));
+        vuRight.setBounds (meters.removeFromRight (meterWidth));
     }
 
     // PhaseQ and graphic EQ pages: the graph
