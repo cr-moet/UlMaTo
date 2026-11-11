@@ -4,7 +4,10 @@
 
 //==============================================================================
 // Analog heat: the colour of analog gear, in this order
-//   1. tape transport: wow (slow) and flutter (fast) pitch movement - a modulated delay,
+//   1. tape transport as described for the Abbey Road J37: wow is a slow movement of the
+//      pitch (speed of the motor, a modulated delay), flutter a fast movement of the level
+//      (the tape moving against the heads); each with depth and rate around the reference
+//      of the machine,
 //   2. vinyl crackle: clicks and the odd pop, each at its own place in the stereo field,
 //   3. (2x oversampled from here on)
 //      tape saturation per band (the five bands of the dynamics), warm and asymmetric,
@@ -23,11 +26,13 @@ namespace Analog
     struct Settings
     {
         Dynamics::Values tape {};   // 0 ... 1 per band
-        float wow = 0.0f, flutter = 0.0f, crackle = 0.0f, tube = 0.0f, transformer = 0.0f;
+        float wowDepth = 0.0f, flutterDepth = 0.0f;           // 0 (off) ... 1 (full)
+        float wowRate = 0.8f, flutterRate = 5.15f;            // Hz
+        float crackle = 0.0f, tube = 0.0f, transformer = 0.0f;
 
         bool isActive() const noexcept
         {
-            bool any = wow > 0.0f || flutter > 0.0f || crackle > 0.0f || tube > 0.0f || transformer > 0.0f;
+            bool any = wowDepth > 0.0f || flutterDepth > 0.0f || crackle > 0.0f || tube > 0.0f || transformer > 0.0f;
             for (auto t : tape)
                 any = any || t > 0.0f;
             return any;
@@ -43,7 +48,7 @@ namespace Analog
             oversampling.initProcessing ((size_t) maxBlockSize);
             splitter.prepare (sampleRate * 2.0, true);
 
-            transportDelay = juce::jmax (16, juce::roundToInt (sampleRate * 0.005));   // 5 ms around which wow/flutter move
+            transportDelay = juce::jmax (48, juce::roundToInt (sampleRate * 0.015));   // 15 ms around which the wow moves
             latency = transportDelay + juce::roundToInt (oversampling.getLatencyInSamples());
             transport.setSize (2, juce::nextPowerOfTwo (transportDelay * 2 + 8));
             dry.setSize (2, latency + 1);
@@ -72,8 +77,9 @@ namespace Analog
             transport.clear();
             dry.clear();
             transportPosition = dryPosition = 0;
-            wowPhase = flutterPhase = flutterPhase2 = 0.0;
-            drift = driftTarget = flutterNoise = 0.0f;
+            wowPhase = flutterPhase = 0.0;
+            drift = driftTarget = flutterNoise = rateJitter = 0.0f;
+            wowAmount = flutterAmount = 0.0f;
             driftCounter = 0;
             crackleEnv = { 0.0f, 0.0f };
             crackleDecay = 0.0f;
@@ -162,24 +168,34 @@ namespace Analog
             tl[transportPosition] = l;
             tr[transportPosition] = r;
 
-            // Delay in samples: wow up to 1.5 % pitch at ~0.5 Hz with a slow random drift,
-            // flutter up to 0.5 % at ~7 Hz plus 11 Hz and a little noise
+            // Wow: the pitch moves at the wow rate (with its second harmonic, as from an
+            // eccentric capstan, and a slow random drift); full depth swings the pitch by 5 %
+            // (the reference machine, ~0.05 %, is near 10 %) - the delay swing that gives this
+            // is fs * deviation / (2 pi rate)
             const double twoPi = juce::MathConstants<double>::twoPi;
-            wowPhase      = std::fmod (wowPhase + twoPi * 0.55 / sampleRate, twoPi);
-            flutterPhase  = std::fmod (flutterPhase + twoPi * 7.1 / sampleRate, twoPi);
-            flutterPhase2 = std::fmod (flutterPhase2 + twoPi * 11.3 / sampleRate, twoPi);
             if (--driftCounter <= 0)
             {
                 driftCounter = juce::roundToInt (sampleRate * 0.7);
                 driftTarget = random();
             }
             drift += (driftTarget - drift) * (float) (2.0 / sampleRate);
-            flutterNoise += (random() - flutterNoise) * (float) (60.0 / sampleRate);
+            rateJitter += (random() - rateJitter) * (float) (3.0 / sampleRate);   // the transport never runs perfectly even
+            flutterNoise += (random() - flutterNoise) * (float) (40.0 / sampleRate);
+            wowPhase     = std::fmod (wowPhase + twoPi * s.wowRate * (1.0 + 0.03 * rateJitter) / sampleRate, twoPi);
+            flutterPhase = std::fmod (flutterPhase + twoPi * s.flutterRate * (1.0 + 0.06 * rateJitter) / sampleRate, twoPi);
 
-            const float wowDepth = (float) (0.015 * sampleRate / (twoPi * 0.55)), flutterDepth = (float) (0.005 * sampleRate / (twoPi * 7.1));
-            const float modulation = s.wow * wowDepth * (0.75f * (float) std::sin (wowPhase) + 0.25f * drift)
-                                   + s.flutter * flutterDepth * (0.7f * (float) std::sin (flutterPhase) + 0.3f * (float) std::sin (flutterPhase2) + flutterNoise);
-            const float delay = (float) transportDelay + juce::jlimit (-(float) transportDelay + 2.0f, (float) transportDelay - 2.0f, modulation);
+            const float smoothing = (float) (30.0 / sampleRate);   // depth changes glide (no clicks)
+            wowAmount     += smoothing * (s.wowDepth - wowAmount);
+            flutterAmount += smoothing * (s.flutterDepth - flutterAmount);
+
+            const float swing = juce::jmin ((float) (0.05 * sampleRate / (twoPi * s.wowRate)) * wowAmount, (float) transportDelay - 3.0f);
+            const float modulation = swing * (0.75f * (float) std::sin (wowPhase) + 0.12f * (float) std::sin (2.0 * wowPhase + 0.7) + 0.2f * drift);
+
+            // Flutter: the level moves at the flutter rate; full depth by about +-4 dB (the
+            // reference machine, ~0.1 dB, is near 15 %)
+            const float flutterGain = 1.0f + 0.5f * flutterAmount
+                                    * (0.8f * (float) std::sin (flutterPhase) + 0.15f * (float) std::sin (2.0 * flutterPhase + 1.3) + 0.25f * flutterNoise);
+            const float delay = (float) transportDelay + modulation;
 
             // Cubic (Hermite) interpolation
             const int whole = (int) std::floor (delay);
@@ -190,8 +206,8 @@ namespace Analog
                 const float c1 = 0.5f * (x1 - xm1), c2 = xm1 - 2.5f * x0 + 2.0f * x1 - 0.5f * x2, c3 = 0.5f * (x2 - xm1) + 1.5f * (x0 - x1);
                 return ((c3 * frac + c2) * frac + c1) * frac + x0;
             };
-            l = hermite (at (tl, whole - 1), at (tl, whole), at (tl, whole + 1), at (tl, whole + 2));
-            r = hermite (at (tr, whole - 1), at (tr, whole), at (tr, whole + 1), at (tr, whole + 2));
+            l = flutterGain * hermite (at (tl, whole - 1), at (tl, whole), at (tl, whole + 1), at (tl, whole + 2));
+            r = flutterGain * hermite (at (tr, whole - 1), at (tr, whole), at (tr, whole + 1), at (tr, whole + 2));
             transportPosition = (transportPosition + 1) & (length - 1);
 
             // Vinyl crackle: up to 30 small clicks and 1.5 pops per second, each a short,
@@ -322,8 +338,8 @@ namespace Analog
 
         juce::AudioBuffer<float> transport, dry, input;
         int transportDelay = 48, transportPosition = 0, dryPosition = 0, latency = 0, driftCounter = 0;
-        double wowPhase = 0.0, flutterPhase = 0.0, flutterPhase2 = 0.0;
-        float drift = 0.0f, driftTarget = 0.0f, flutterNoise = 0.0f;
+        double wowPhase = 0.0, flutterPhase = 0.0;
+        float drift = 0.0f, driftTarget = 0.0f, flutterNoise = 0.0f, rateJitter = 0.0f, wowAmount = 0.0f, flutterAmount = 0.0f;
 
         std::array<float, 2> crackleEnv {}, crackleState {}, crackleLast {}, dcIn {}, dcOut {}, core {}, powerIn {}, powerOut {}, makeUp {};
         float crackleDecay = 0.0f, crackleHighpass = 0.0f, dcCoefficient = 0.0f, coreCoefficient = 0.0f;

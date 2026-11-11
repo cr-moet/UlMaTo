@@ -709,7 +709,7 @@ void MatchEngine::updateToneStages()
         designedPhase = phase;
 
     const auto eq = eqShared.get();
-    if (eq.freq[0] > 0.0f && eq != designedEq
+    if (eq.valid && eq != designedEq
          && graphicFilter.update (sampleRate, [&eq] (float f) { return Tone::eqResponse (eq, f); }))
         designedEq = eq;
 }

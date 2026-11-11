@@ -13,16 +13,21 @@ namespace ParamIDs
 
     // Analog heat (all 0 ... 100 %)
     inline constexpr const char* tape[] { "tape1", "tape2", "tape3", "tape4", "tape5" };
-    inline constexpr const char* wow         = "wow";
-    inline constexpr const char* flutter     = "flutter";
+    inline constexpr const char* wowDepth     = "wowDepth";       // 0 % (off) ... 100 %
+    inline constexpr const char* wowRate      = "wowRate";        // -50 ... 0 (reference machine) ... +50, shown in Hz
+    inline constexpr const char* flutterDepth = "flutterDepth";
+    inline constexpr const char* flutterRate  = "flutterRate";
     inline constexpr const char* crackle     = "crackle";
     inline constexpr const char* tube        = "tube";
     inline constexpr const char* transformer = "transformer";
 
-    // Graphic EQ: six bands
-    inline constexpr const char* eqFreq[] { "eqFreq1", "eqFreq2", "eqFreq3", "eqFreq4", "eqFreq5", "eqFreq6" };
-    inline constexpr const char* eqGain[] { "eqGain1", "eqGain2", "eqGain3", "eqGain4", "eqGain5", "eqGain6" };
-    inline constexpr const char* eqQ[]    { "eqQ1", "eqQ2", "eqQ3", "eqQ4", "eqQ5", "eqQ6" };
+    // Graphic EQ: twelve bands (off until created), bell / low shelf / high shelf, bypassable
+    inline constexpr const char* eqOn[12] { "eqOn1", "eqOn2", "eqOn3", "eqOn4", "eqOn5", "eqOn6", "eqOn7", "eqOn8", "eqOn9", "eqOn10", "eqOn11", "eqOn12" };
+    inline constexpr const char* eqBypass[12] { "eqBypass1", "eqBypass2", "eqBypass3", "eqBypass4", "eqBypass5", "eqBypass6", "eqBypass7", "eqBypass8", "eqBypass9", "eqBypass10", "eqBypass11", "eqBypass12" };
+    inline constexpr const char* eqType[12] { "eqType1", "eqType2", "eqType3", "eqType4", "eqType5", "eqType6", "eqType7", "eqType8", "eqType9", "eqType10", "eqType11", "eqType12" };
+    inline constexpr const char* eqFreq[12] { "eqFreq1", "eqFreq2", "eqFreq3", "eqFreq4", "eqFreq5", "eqFreq6", "eqFreq7", "eqFreq8", "eqFreq9", "eqFreq10", "eqFreq11", "eqFreq12" };
+    inline constexpr const char* eqGain[12] { "eqGain1", "eqGain2", "eqGain3", "eqGain4", "eqGain5", "eqGain6", "eqGain7", "eqGain8", "eqGain9", "eqGain10", "eqGain11", "eqGain12" };
+    inline constexpr const char* eqQ[12] { "eqQ1", "eqQ2", "eqQ3", "eqQ4", "eqQ5", "eqQ6", "eqQ7", "eqQ8", "eqQ9", "eqQ10", "eqQ11", "eqQ12" };
 
     // PhaseQ: twelve nodes (off until created), each left or right, bell / low shelf / high shelf, bypassable
     inline constexpr const char* phaseOn[12] { "phaseOn1", "phaseOn2", "phaseOn3", "phaseOn4", "phaseOn5", "phaseOn6", "phaseOn7", "phaseOn8", "phaseOn9", "phaseOn10", "phaseOn11", "phaseOn12" };
@@ -146,8 +151,10 @@ private:
     std::atomic<float>* dynamicsParam = nullptr;
     juce::AudioParameterBool* bypassParam = nullptr;
     std::array<std::atomic<float>*, Dynamics::numBands> tapeParams {};
-    std::atomic<float>* wowParam = nullptr;
-    std::atomic<float>* flutterParam = nullptr;
+    std::atomic<float>* wowDepthParam = nullptr;
+    std::atomic<float>* wowRateParam = nullptr;
+    std::atomic<float>* flutterDepthParam = nullptr;
+    std::atomic<float>* flutterRateParam = nullptr;
     std::atomic<float>* crackleParam = nullptr;
     std::atomic<float>* tubeParam = nullptr;
     std::atomic<float>* transformerParam = nullptr;

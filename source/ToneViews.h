@@ -279,99 +279,42 @@ protected:
 };
 
 //==============================================================================
-class GraphicEqView final : public NodeEditor
+// Parameters of a list of nodes that are created by double-click (PhaseQ, graphic EQ)
+struct NodeSet
 {
-public:
-    explicit GraphicEqView (UlMaToProcessor& p)
-        : NodeEditor (p, "GRAPHIC EQ  [dB]  (linear phase: only the level changes)", -18.0f, 18.0f, 6.0f)
-    {
-        hint = "drag a node  -  wheel: Q  -  double-click: 0 dB   (1: low shelf, 6: high shelf)";
-    }
-
-protected:
-    const char* freqId (int n) const override   { return ParamIDs::eqFreq[n]; }
-    const char* valueId (int n) const override  { return ParamIDs::eqGain[n]; }
-    const char* widthId (int n) const override  { return ParamIDs::eqQ[n]; }
-
-    Tone::EqSettings settings() const
-    {
-        Tone::EqSettings s;
-        for (size_t b = 0; b < (size_t) Tone::numBands; ++b)
-            s = withBand (s, b);
-        return s;
-    }
-
-    Tone::EqSettings withBand (Tone::EqSettings s, size_t b) const
-    {
-        s.freq[b] = value (ParamIDs::eqFreq[b]);
-        s.gain[b] = value (ParamIDs::eqGain[b]);
-        s.q[b]    = value (ParamIDs::eqQ[b]);
-        return s;
-    }
-
-    float nodeCurve (int n, float f) const override
-    {
-        return juce::Decibels::gainToDecibels (Tone::bandMagnitude (Tone::eqTypes[n], value (ParamIDs::eqFreq[n]),
-                                                                    value (ParamIDs::eqGain[n]), value (ParamIDs::eqQ[n]), f));
-    }
-
-    float totalCurve (float f) const override
-    {
-        return juce::Decibels::gainToDecibels (Tone::eqMagnitude (settings(), f));
-    }
-
-    juce::String describe (int n) const override
-    {
-        const float f = value (ParamIDs::eqFreq[n]), gain = value (ParamIDs::eqGain[n]);
-        static constexpr const char* types[] { "LOW SHELF", "BELL", "HIGH SHELF" };
-        return juce::String (n + 1) + "  " + types[(int) Tone::eqTypes[n]] + "   "
-             + (f < 1000.0f ? juce::String (f, 0) + " Hz" : juce::String (f / 1000.0f, 2) + " kHz") + "   "
-             + (gain > 0.0f ? "+" : "") + juce::String (gain, 1) + " dB   Q " + juce::String (value (ParamIDs::eqQ[n]), 2);
-    }
-
-    // The processed signal behind the curve (mid, scaled into the plot)
-    void drawBackground (juce::Graphics& g) override
-    {
-        const auto out = processor.getOutputProfile();
-        if (! out.valid)
-            return;
-        juce::Path area;
-        area.startNewSubPath (plot.getX(), plot.getBottom());
-        for (int b = 0; b < Spectrum::numBands; ++b)
-        {
-            const float level = juce::jlimit (0.0f, 1.0f, (Spectrum::toDb (out.mid[(size_t) b]) + 96.0f) / 96.0f);
-            area.lineTo (xOf (Spectrum::bandFrequency ((float) b)), plot.getBottom() - level * plot.getHeight());
-        }
-        area.lineTo (plot.getRight(), plot.getBottom());
-        area.closeSubPath();
-        g.setColour (Colours::text.withAlpha (0.07f));
-        g.fillPath (area);
-    }
+    int count;
+    const char* const* on;
+    const char* const* bypass;
+    const char* const* shape;      // choice: bell, low shelf, high shelf
+    const char* const* side;       // choice left / right, nullptr: no channel choice
+    const char* const* freq;
+    const char* const* value;      // phase in degrees / gain in dB
+    const char* const* q;
+    const char* valueName;         // "PHASE" / "GAIN"
 };
 
-//==============================================================================
-// PhaseQ node names: the channel and the number among the nodes of that channel
-// (L1, L2, R1 ...), so a node switched to the right becomes the next free R number
-inline juce::String phaseNodeName (const juce::AudioProcessorValueTreeState& state, int node)
+// Names: PhaseQ the channel and the number among the nodes of that channel (L1, L2, R1 ...,
+// a node switched to the right becomes the next free R number); EQ the number among its bands
+inline juce::String nodeName (const juce::AudioProcessorValueTreeState& state, const NodeSet& set, int node)
 {
     const auto value = [&state] (const char* id) { return state.getRawParameterValue (id)->load(); };
-    const bool right = value (ParamIDs::phaseSide[node]) > 0.5f;
+    const auto sideOf = [&] (int n) { return set.side != nullptr && value (set.side[n]) > 0.5f; };
     int number = 0;
     for (int n = 0; n <= node; ++n)
-        if ((value (ParamIDs::phaseOn[n]) > 0.5f || n == node) && (value (ParamIDs::phaseSide[n]) > 0.5f) == right)
+        if ((value (set.on[n]) > 0.5f || n == node) && sideOf (n) == sideOf (node))
             ++number;
-    return (right ? "R" : "L") + juce::String (number);
+    return (set.side == nullptr ? juce::String() : juce::String (sideOf (node) ? "R" : "L")) + juce::String (number);
 }
 
 //==============================================================================
-// PhaseQ node strip: a thin row below the display with the controls of the selected
-// node - name, LEFT / RIGHT, shape (bell, low shelf, high shelf), BYPASS, FREQ, PHASE,
-// Q (small knobs) and X (remove) on the right
-class PhaseNodeStrip final : public juce::Component,
-                             private juce::Timer
+// Node strip: a thin raised row below the display with the controls of the selected node -
+// name, LEFT / RIGHT (PhaseQ), shape (bell, low shelf, high shelf), BYPASS, FREQ, PHASE or
+// GAIN, Q (small knobs) and X (remove) on the right
+class NodeStrip final : public juce::Component,
+                        private juce::Timer
 {
 public:
-    explicit PhaseNodeStrip (juce::AudioProcessorValueTreeState& s) : state (s)
+    NodeStrip (juce::AudioProcessorValueTreeState& s, const NodeSet& nodeSet) : state (s), set (nodeSet)
     {
         for (size_t i = 0; i < knobs.size(); ++i)
         {
@@ -379,7 +322,7 @@ public:
             knobs[i].setTextBoxStyle (juce::Slider::TextBoxRight, false, 70, 20);
             knobs[i].setColour (juce::Slider::textBoxBackgroundColourId, Colours::text);
             knobs[i].setColour (juce::Slider::textBoxTextColourId, Colours::accent);
-            labels[i].setText (std::array { "FREQ", "PHASE", "Q" }[i], juce::dontSendNotification);
+            labels[i].setText (std::array { "FREQ", set.valueName, "Q" }[i], juce::dontSendNotification);
             labels[i].setFont (juce::Font (juce::FontOptions (11.0f, juce::Font::bold)));
             labels[i].setJustificationType (juce::Justification::centredLeft);
         }
@@ -392,7 +335,6 @@ public:
         bypassButton.setClickingTogglesState (true);
         bypassButton.getProperties().set ("led", true);
         bypassButton.getProperties().set ("ledInverted", true);   // lit while the node is active
-        removeButton.setTooltip ("Remove this node");
         removeButton.onClick = [this] { if (onRemove != nullptr) onRemove(); };
         for (auto* c : controls())
             addChildComponent (c);
@@ -412,14 +354,14 @@ public:
         bypassAttachment.reset();
         if (node >= 0)
         {
-            const char* ids[] { ParamIDs::phaseFreq[node], ParamIDs::phaseAmount[node], ParamIDs::phaseQ[node] };
+            const char* ids[] { set.freq[node], set.value[node], set.q[node] };
             for (size_t i = 0; i < knobs.size(); ++i)
                 attachments[i] = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (state, ids[i], knobs[i]);
-            shapeAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (state, ParamIDs::phaseShape[node], shapeBox);
-            bypassAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (state, ParamIDs::phaseBypass[node], bypassButton);
+            shapeAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (state, set.shape[node], shapeBox);
+            bypassAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (state, set.bypass[node], bypassButton);
         }
         for (auto* c : controls())
-            c->setVisible (node >= 0);
+            c->setVisible (node >= 0 && (set.side != nullptr || (c != &leftButton && c != &rightButton)));
         refresh();
         repaint();
     }
@@ -445,14 +387,17 @@ public:
     {
         auto r = getLocalBounds().withTrimmedRight (4).withTrimmedBottom (5).reduced (22, 5);
         const auto gap = [&r] (int w) { r.removeFromLeft (w); };
+        const auto centred = [] (juce::Rectangle<int> c) { return c.withSizeKeepingCentre (c.getWidth(), 30); };
         removeButton.setBounds (r.removeFromRight (32).withSizeKeepingCentre (30, 30));
         nameArea = r.removeFromLeft (44);
         gap (6);
-        const auto centred = [] (juce::Rectangle<int> c) { return c.withSizeKeepingCentre (c.getWidth(), 30); };
-        leftButton.setBounds (centred (r.removeFromLeft (62)));
-        gap (4);
-        rightButton.setBounds (centred (r.removeFromLeft (62)));
-        gap (10);
+        if (set.side != nullptr)
+        {
+            leftButton.setBounds (centred (r.removeFromLeft (62)));
+            gap (4);
+            rightButton.setBounds (centred (r.removeFromLeft (62)));
+            gap (10);
+        }
         shapeBox.setBounds (centred (r.removeFromLeft (130)));
         gap (10);
         bypassButton.setBounds (centred (r.removeFromLeft (86)));
@@ -477,7 +422,7 @@ private:
 
     void setSide (int side)
     {
-        auto* p = state.getParameter (ParamIDs::phaseSide[node]);
+        auto* p = state.getParameter (set.side[node]);
         p->beginChangeGesture();
         p->setValueNotifyingHost (p->convertTo0to1 ((float) side));
         p->endChangeGesture();
@@ -488,10 +433,13 @@ private:
     {
         if (node < 0)
             return;
-        const bool right = state.getRawParameterValue (ParamIDs::phaseSide[node])->load() > 0.5f;
-        leftButton.setToggleState (! right, juce::dontSendNotification);
-        rightButton.setToggleState (right, juce::dontSendNotification);
-        if (const auto newName = phaseNodeName (state, node); newName != name)
+        if (set.side != nullptr)
+        {
+            const bool right = state.getRawParameterValue (set.side[node])->load() > 0.5f;
+            leftButton.setToggleState (! right, juce::dontSendNotification);
+            rightButton.setToggleState (right, juce::dontSendNotification);
+        }
+        if (const auto newName = nodeName (state, set, node); newName != name)
         {
             name = newName;
             repaint();
@@ -505,7 +453,8 @@ private:
     }
 
     juce::AudioProcessorValueTreeState& state;
-    std::array<juce::Slider, 3> knobs;   // freq, phase, Q
+    const NodeSet& set;
+    std::array<juce::Slider, 3> knobs;   // freq, phase / gain, Q
     std::array<juce::Label, 3> labels;
     std::array<std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment>, 3> attachments;
     juce::ComboBox shapeBox;
@@ -518,19 +467,14 @@ private:
 };
 
 //==============================================================================
-// PhaseQ: both channels in one graph - left solid, right dashed (both orange). It starts
-// without nodes; a double-click on the graph creates one (on a node: removes it). The strip
-// below the display edits the selected node.
-class PhaseQView final : public NodeEditor
+// Graph of nodes created by double-click (on a node: removes it); the strip below the
+// display edits the selected node
+class NodeListView : public NodeEditor
 {
 public:
-    explicit PhaseQView (UlMaToProcessor& p)
-        : NodeEditor (p, juce::String (juce::CharPointer_UTF8 ("PHASEQ  [\xc2\xb0]  -  LEFT solid, RIGHT dashed  (only the phase changes, the level stays flat)")),
-                      -180.0f, 180.0f, 45.0f),
-          strip (p.apvts)
+    NodeListView (UlMaToProcessor& p, const juce::String& titleText, float bottomValue, float topValue, float gridStep, const NodeSet& nodeSet)
+        : NodeEditor (p, titleText, bottomValue, topValue, gridStep), set (nodeSet), strip (p.apvts, set)
     {
-        curveColour = Colours::correlation;
-        hint = "double-click: new node / remove node  -  drag a node  -  wheel: Q";
         stripHeight = 74.0f;
         addAndMakeVisible (strip);
         strip.onRemove = [this] { remove (selected); };
@@ -557,78 +501,58 @@ public:
     }
 
 protected:
-    int numNodes() const override              { return Tone::numPhaseNodes; }
-    bool isActive (int n) const override       { return value (ParamIDs::phaseOn[n]) > 0.5f; }
-    const char* freqId (int n) const override   { return ParamIDs::phaseFreq[n]; }
-    const char* valueId (int n) const override  { return ParamIDs::phaseAmount[n]; }
-    const char* widthId (int n) const override  { return ParamIDs::phaseQ[n]; }
+    int numNodes() const override              { return set.count; }
+    bool isActive (int n) const override       { return value (set.on[n]) > 0.5f; }
+    const char* freqId (int n) const override   { return set.freq[n]; }
+    const char* valueId (int n) const override  { return set.value[n]; }
+    const char* widthId (int n) const override  { return set.q[n]; }
 
-    int channelOf (int n) const       { return value (ParamIDs::phaseSide[n]) > 0.5f ? 1 : 0; }
-    bool isBypassed (int n) const     { return value (ParamIDs::phaseBypass[n]) > 0.5f; }
-    Tone::PhaseShape shapeOf (int n) const   { return (Tone::PhaseShape) juce::roundToInt (value (ParamIDs::phaseShape[n])); }
+    bool isBypassed (int n) const    { return value (set.bypass[n]) > 0.5f; }
+    int shapeIndex (int n) const     { return juce::roundToInt (value (set.shape[n])); }
+    juce::String nameOf (int n) const   { return nodeName (processor.apvts, set, n); }
 
-    // withBypassed: bypassed nodes count too (for their own faint curve)
-    Tone::PhaseSettings settings (bool withBypassed = false) const
+    juce::String shapeName (int n) const
     {
-        Tone::PhaseSettings s;
-        for (int n = 0; n < Tone::numPhaseNodes; ++n)
-            s.node[(size_t) n] = { isActive (n) && (withBypassed || ! isBypassed (n)), channelOf (n), shapeOf (n),
-                                   value (ParamIDs::phaseFreq[n]), value (ParamIDs::phaseAmount[n]), value (ParamIDs::phaseQ[n]) };
-        return s;
+        static constexpr const char* shapes[] { "BELL", "LOW SHELF", "HIGH SHELF" };
+        return shapes[juce::jlimit (0, 2, shapeIndex (n))];
     }
 
-    float nodeCurve (int n, float f) const override   { return juce::radiansToDegrees (Tone::phaseAt (settings (true), channelOf (n), f, n)); }
-    float totalCurve (float f) const override         { return juce::radiansToDegrees (Tone::phaseAt (settings(), 0, f)); }
-
-    void drawTotals (juce::Graphics& g) override
-    {
-        const auto s = settings();
-        drawCurve (g, [&s] (float f) { return juce::radiansToDegrees (Tone::phaseAt (s, 0, f)); }, curveColour, 2.4f);
-        drawCurve (g, [&s] (float f) { return juce::radiansToDegrees (Tone::phaseAt (s, 1, f)); }, curveColour.darker (0.35f), 2.2f, true);
-    }
-
-    void drawNode (juce::Graphics& g, int n, juce::Point<float> c, bool on) override
+    // Node marker: rounded (bell) or square (shelves), dashed outline for the right channel,
+    // grey while bypassed
+    void drawMarker (juce::Graphics& g, int n, juce::Point<float> c, bool on, bool dashed)
     {
         const auto r = juce::Rectangle<float> (26.0f, 16.0f).withCentre (c);
-        const bool right = channelOf (n) == 1, bypassed = isBypassed (n);
-        const float corner = shapeOf (n) == Tone::PhaseShape::bell ? 8.0f : 2.0f;   // shelves: square corners
+        const bool bypassed = isBypassed (n);
+        const float corner = shapeIndex (n) == 0 ? 8.0f : 2.0f;
         const auto fill = bypassed ? Colours::display.brighter (0.25f) : curveColour;
-        g.setColour (on ? fill : (right ? Colours::display : fill.withAlpha (0.45f)));
+        g.setColour (on ? fill : (dashed ? Colours::display : fill.withAlpha (0.45f)));
         g.fillRoundedRectangle (r, corner);
         g.setColour (on && ! bypassed ? Colours::background : Colours::text.withAlpha (bypassed ? 0.55f : 1.0f));
         g.setFont (juce::Font (juce::FontOptions (10.0f, juce::Font::bold)));
-        g.drawText (phaseNodeName (processor.apvts, n), r, juce::Justification::centred);
+        g.drawText (nameOf (n), r, juce::Justification::centred);
         g.setColour (Colours::text.withAlpha (bypassed ? 0.55f : 1.0f));
         juce::Path outline;
         outline.addRoundedRectangle (r, corner);
-        if (right)
+        if (dashed)
         {
-            juce::Path dashed;
-            const float dashes[] { 3.0f, 2.0f };
-            juce::PathStrokeType (1.2f).createDashedStroke (dashed, outline, dashes, 2);
-            g.fillPath (dashed);
+            juce::Path dashes;
+            const float pattern[] { 3.0f, 2.0f };
+            juce::PathStrokeType (1.2f).createDashedStroke (dashes, outline, pattern, 2);
+            g.fillPath (dashes);
         }
         else
             g.strokePath (outline, juce::PathStrokeType (1.2f));
     }
 
-    juce::String describe (int n) const override
-    {
-        static constexpr const char* shapes[] { "BELL", "LOW SHELF", "HIGH SHELF" };
-        const float f = value (ParamIDs::phaseFreq[n]), amount = value (ParamIDs::phaseAmount[n]);
-        return phaseNodeName (processor.apvts, n) + "  " + shapes[(int) shapeOf (n)] + (isBypassed (n) ? " (BYPASSED)   " : "   ")
-             + (f < 1000.0f ? juce::String (f, 0) + " Hz" : juce::String (f / 1000.0f, 2) + " kHz") + "   "
-             + (amount > 0.0f ? "+" : "") + juce::String (amount, 0) + juce::String (juce::CharPointer_UTF8 ("\xc2\xb0"))
-             + "   Q " + juce::String (value (ParamIDs::phaseQ[n]), 2);
-    }
-
-private:
     void timerCallback() override
     {
         NodeEditor::timerCallback();
         updateStrip();   // nodes can also change from the host (automation, undo, presets)
     }
 
+    const NodeSet& set;
+
+private:
     void updateStrip()
     {
         if (selected >= 0 && ! isActive (selected))
@@ -644,13 +568,14 @@ private:
             if (! isActive (n))
             {
                 const float x = juce::jlimit (0.0f, 1.0f, (p.x - plot.getX()) / plot.getWidth());
-                setWithGesture (ParamIDs::phaseFreq[n], 20.0f * std::pow (1000.0f, x));
-                setWithGesture (ParamIDs::phaseAmount[n], juce::jlimit (bottom, top, top - (p.y - plot.getY()) / plot.getHeight() * (top - bottom)));
-                setWithGesture (ParamIDs::phaseQ[n], 1.0f);
-                setWithGesture (ParamIDs::phaseSide[n], 0.0f);
-                setWithGesture (ParamIDs::phaseShape[n], 0.0f);
-                setWithGesture (ParamIDs::phaseBypass[n], 0.0f);
-                setWithGesture (ParamIDs::phaseOn[n], 1.0f);
+                setWithGesture (set.freq[n], 20.0f * std::pow (1000.0f, x));
+                setWithGesture (set.value[n], juce::jlimit (bottom, top, top - (p.y - plot.getY()) / plot.getHeight() * (top - bottom)));
+                setWithGesture (set.q[n], 1.0f);
+                if (set.side != nullptr)
+                    setWithGesture (set.side[n], 0.0f);
+                setWithGesture (set.shape[n], 0.0f);
+                setWithGesture (set.bypass[n], 0.0f);
+                setWithGesture (set.on[n], 1.0f);
                 select (n, true);
                 return;
             }
@@ -661,8 +586,8 @@ private:
     {
         if (n < 0)
             return;
-        setWithGesture (ParamIDs::phaseOn[n], 0.0f);
-        setWithGesture (ParamIDs::phaseAmount[n], 0.0f);
+        setWithGesture (set.on[n], 0.0f);
+        setWithGesture (set.value[n], 0.0f);
         if (n == selected)
         {
             selected = -1;
@@ -677,7 +602,120 @@ private:
         repaint();
     }
 
-    PhaseNodeStrip strip;
+    NodeStrip strip;
+};
+
+//==============================================================================
+inline const NodeSet eqNodeSet { Tone::numBands, ParamIDs::eqOn, ParamIDs::eqBypass, ParamIDs::eqType, nullptr,
+                                 ParamIDs::eqFreq, ParamIDs::eqGain, ParamIDs::eqQ, "GAIN" };
+inline const NodeSet phaseNodeSet { Tone::numPhaseNodes, ParamIDs::phaseOn, ParamIDs::phaseBypass, ParamIDs::phaseShape, ParamIDs::phaseSide,
+                                    ParamIDs::phaseFreq, ParamIDs::phaseAmount, ParamIDs::phaseQ, "PHASE" };
+
+//==============================================================================
+// Graphic EQ: bands created by double-click, linear phase; the processed signal faintly
+// behind the curve
+class GraphicEqView final : public NodeListView
+{
+public:
+    explicit GraphicEqView (UlMaToProcessor& p)
+        : NodeListView (p, "GRAPHIC EQ  [dB]  (linear phase: only the level changes)", -18.0f, 18.0f, 6.0f, eqNodeSet)
+    {
+        hint = "double-click: new band / remove band  -  drag a band  -  wheel: Q";
+    }
+
+protected:
+    Tone::EqBand band (int n, bool withBypassed) const
+    {
+        return { isActive (n) && (withBypassed || ! isBypassed (n)), (Tone::EqType) shapeIndex (n),
+                 value (ParamIDs::eqFreq[n]), value (ParamIDs::eqGain[n]), value (ParamIDs::eqQ[n]) };
+    }
+
+    float nodeCurve (int n, float f) const override
+    {
+        const auto b = band (n, true);
+        return juce::Decibels::gainToDecibels (Tone::bandMagnitude (b.type, b.freq, b.gain, b.q, f));
+    }
+
+    float totalCurve (float f) const override
+    {
+        Tone::EqSettings s;
+        for (int n = 0; n < Tone::numBands; ++n)
+            s.band[(size_t) n] = band (n, false);
+        return juce::Decibels::gainToDecibels (Tone::eqMagnitude (s, f));
+    }
+
+    void drawNode (juce::Graphics& g, int n, juce::Point<float> c, bool on) override   { drawMarker (g, n, c, on, false); }
+
+    juce::String describe (int n) const override
+    {
+        const float f = value (ParamIDs::eqFreq[n]), gain = value (ParamIDs::eqGain[n]);
+        return nameOf (n) + "  " + shapeName (n) + (isBypassed (n) ? " (BYPASSED)   " : "   ")
+             + (f < 1000.0f ? juce::String (f, 0) + " Hz" : juce::String (f / 1000.0f, 2) + " kHz") + "   "
+             + (gain > 0.0f ? "+" : "") + juce::String (gain, 1) + " dB   Q " + juce::String (value (ParamIDs::eqQ[n]), 2);
+    }
+
+    void drawBackground (juce::Graphics& g) override
+    {
+        spectrum.draw (g, plot, [this] (float f) { return xOf (f); }, 0.07f);
+    }
+
+    void timerCallback() override
+    {
+        NodeListView::timerCallback();
+        if (isShowing())
+            spectrum.update (processor.getOutputProfile(), 0.15f);
+    }
+
+private:
+    Plot::BackgroundSpectrum spectrum;
+};
+
+//==============================================================================
+// PhaseQ: both channels in one graph - left solid, right dashed (both orange)
+class PhaseQView final : public NodeListView
+{
+public:
+    explicit PhaseQView (UlMaToProcessor& p)
+        : NodeListView (p, juce::String (juce::CharPointer_UTF8 ("PHASEQ  [\xc2\xb0]  -  LEFT solid, RIGHT dashed  (only the phase changes, the level stays flat)")),
+                        -180.0f, 180.0f, 45.0f, phaseNodeSet)
+    {
+        curveColour = Colours::correlation;
+        hint = "double-click: new node / remove node  -  drag a node  -  wheel: Q";
+    }
+
+protected:
+    int channelOf (int n) const   { return value (ParamIDs::phaseSide[n]) > 0.5f ? 1 : 0; }
+
+    // withBypassed: bypassed nodes count too (for their own faint curve)
+    Tone::PhaseSettings settings (bool withBypassed = false) const
+    {
+        Tone::PhaseSettings s;
+        for (int n = 0; n < Tone::numPhaseNodes; ++n)
+            s.node[(size_t) n] = { isActive (n) && (withBypassed || ! isBypassed (n)), channelOf (n), (Tone::PhaseShape) shapeIndex (n),
+                                   value (ParamIDs::phaseFreq[n]), value (ParamIDs::phaseAmount[n]), value (ParamIDs::phaseQ[n]) };
+        return s;
+    }
+
+    float nodeCurve (int n, float f) const override   { return juce::radiansToDegrees (Tone::phaseAt (settings (true), channelOf (n), f, n)); }
+    float totalCurve (float f) const override         { return juce::radiansToDegrees (Tone::phaseAt (settings(), 0, f)); }
+
+    void drawTotals (juce::Graphics& g) override
+    {
+        const auto s = settings();
+        drawCurve (g, [&s] (float f) { return juce::radiansToDegrees (Tone::phaseAt (s, 0, f)); }, curveColour, 2.4f);
+        drawCurve (g, [&s] (float f) { return juce::radiansToDegrees (Tone::phaseAt (s, 1, f)); }, curveColour.darker (0.35f), 2.2f, true);
+    }
+
+    void drawNode (juce::Graphics& g, int n, juce::Point<float> c, bool on) override   { drawMarker (g, n, c, on, channelOf (n) == 1); }
+
+    juce::String describe (int n) const override
+    {
+        const float f = value (ParamIDs::phaseFreq[n]), amount = value (ParamIDs::phaseAmount[n]);
+        return nameOf (n) + "  " + shapeName (n) + (isBypassed (n) ? " (BYPASSED)   " : "   ")
+             + (f < 1000.0f ? juce::String (f, 0) + " Hz" : juce::String (f / 1000.0f, 2) + " kHz") + "   "
+             + (amount > 0.0f ? "+" : "") + juce::String (amount, 0) + juce::String (juce::CharPointer_UTF8 ("\xc2\xb0"))
+             + "   Q " + juce::String (value (ParamIDs::phaseQ[n]), 2);
+    }
 };
 
 //==============================================================================

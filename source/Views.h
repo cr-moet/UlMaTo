@@ -50,6 +50,62 @@ namespace Plot
         g.drawRoundedRectangle (r.reduced (0.0f), corner, 0.8f);
     }
 
+    // Faint spectrum behind a graph (mid of the processed signal): smoothed over half an
+    // octave and in time, drawn as a soft curve (no steps, no corners)
+    struct BackgroundSpectrum
+    {
+        Spectrum::Curve shown {};
+        bool started = false;
+
+        void update (const Spectrum::Profile& p, float speed)
+        {
+            if (! p.valid)
+                return;
+            constexpr int width = 3;   // bands on each side (1/12 octave each)
+            for (int b = 0; b < Spectrum::numBands; ++b)
+            {
+                double sum = 0.0;
+                int count = 0;
+                for (int i = juce::jmax (0, b - width); i <= juce::jmin (Spectrum::numBands - 1, b + width); ++i, ++count)
+                    sum += p.mid[(size_t) i];
+                const float db = Spectrum::toDb ((float) (sum / count));
+                auto& v = shown[(size_t) b];
+                v = started ? v + speed * (db - v) : db;
+            }
+            started = true;
+        }
+
+        template <typename XOf>
+        void draw (juce::Graphics& g, juce::Rectangle<float> plot, XOf xOf, float alpha) const
+        {
+            if (! started)
+                return;
+            const auto point = [&] (int b)
+            {
+                const float level = juce::jlimit (0.0f, 1.0f, (shown[(size_t) b] + 96.0f) / 96.0f);
+                return juce::Point<float> (xOf (Spectrum::bandFrequency ((float) b)), plot.getBottom() - level * plot.getHeight());
+            };
+            juce::Path area;
+            area.startNewSubPath (plot.getX(), plot.getBottom());
+            area.lineTo (point (0));
+            for (int b = 1; b < Spectrum::numBands; ++b)   // through the midpoints: a smooth curve
+            {
+                const auto a = point (b - 1), c = point (b);
+                area.quadraticTo (a, (a + c) * 0.5f);
+            }
+            area.lineTo (point (Spectrum::numBands - 1));
+            area.lineTo (plot.getRight(), point (Spectrum::numBands - 1).y);
+            area.lineTo (plot.getRight(), plot.getBottom());
+            area.closeSubPath();
+            juce::Graphics::ScopedSaveState state (g);
+            g.reduceClipRegion (plot.toNearestInt());
+            g.setColour (Colours::text.withAlpha (alpha));
+            g.fillPath (area);
+            g.setColour (Colours::text.withAlpha (alpha * 2.0f));
+            g.strokePath (area, juce::PathStrokeType (0.8f));
+        }
+    };
+
     // Button head screw with hexagon socket (black, slightly glossy dome); rotation turns the
     // socket so the screws do not all look the same
     inline void drawScrew (juce::Graphics& g, juce::Point<float> c, float radius, float rotation)
@@ -736,19 +792,7 @@ private:
     template <typename XOf>
     void drawSpectrum (juce::Graphics& g, juce::Rectangle<float> plot, XOf xOf) const
     {
-        if (! output.valid)
-            return;
-        juce::Path area;
-        area.startNewSubPath (plot.getX(), plot.getBottom());
-        for (int b = 0; b < Spectrum::numBands; ++b)
-        {
-            const float level = juce::jlimit (0.0f, 1.0f, (Spectrum::toDb (output.mid[(size_t) b]) + 96.0f) / 96.0f);
-            area.lineTo (xOf (Spectrum::bandFrequency ((float) b)), plot.getBottom() - level * plot.getHeight());
-        }
-        area.lineTo (plot.getRight(), plot.getBottom());
-        area.closeSubPath();
-        g.setColour (Colours::text.withAlpha (0.06f));
-        g.fillPath (area);
+        spectrum.draw (g, plot, xOf, 0.06f);
     }
 
     void timerCallback() override
@@ -761,8 +805,8 @@ private:
             slowTicks = 0;
             state = processor.getDynamicsState();
             learned = processor.getLearnedDynamics();
-            output = processor.getOutputProfile();
         }
+        spectrum.update (processor.getOutputProfile(), 0.12f);   // smooth in time, 30 updates per second
 
         // Bars: quickly towards more gain change, back slowly; peak marks fall 3 dB/s
         for (size_t b = 0; b < (size_t) Dynamics::numBands; ++b)
@@ -783,7 +827,7 @@ private:
     UlMaToProcessor& processor;
     MatchEngine::DynamicsState state;
     Dynamics::Profile reference, learned;
-    Spectrum::Profile output;
+    Plot::BackgroundSpectrum spectrum;
     Dynamics::Values gains {}, shownGains {}, cutPeaks {}, boostPeaks {};
     int slowTicks = 15, numberTicks = 0;
 

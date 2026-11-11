@@ -69,7 +69,7 @@ private:
         std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> attachment;
     };
     std::array<LabelledKnob, Dynamics::numBands> tapeKnobs;
-    std::array<LabelledKnob, 5> heatKnobs;   // wow, flutter, crackle, tube, transformer
+    std::array<LabelledKnob, 7> heatKnobs;   // wow depth / rate, flutter depth / rate, crackle, tube, transformer
     juce::Rectangle<int> tapePanel, transportPanel, outputPanel;
     std::vector<std::pair<int, juce::Rectangle<int>>> controlPanels;   // page, raised screwed panel around its controls
 

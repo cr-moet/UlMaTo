@@ -10,7 +10,7 @@
 // PhaseQ   - changes only the phase (the magnitude stays exactly flat): up to twelve
 //            nodes, each on the left or right channel, a bell or a low / high shelf of phase over
 //            frequency with its own Q.
-// Graphic  - six bands (low shelf, four bells, high shelf), linear phase: only the
+// Graphic  - up to twelve bands (bell, low / high shelf), linear phase: only the
 // EQ         magnitude changes.
 //==============================================================================
 namespace Tone
@@ -40,19 +40,28 @@ namespace Tone
     };
 
     //==========================================================================
-    constexpr int numBands = 6;
-    using Values = std::array<float, numBands>;
+    // Graphic EQ: up to twelve bands (off until created), each bell, low or high shelf
+    constexpr int numBands = 12;
+    enum class EqType { bell, lowShelf, highShelf };
+
+    struct EqBand
+    {
+        bool on = false;
+        EqType type = EqType::bell;
+        float freq = 1000.0f, gain = 0.0f, q = 1.0f;   // Hz, dB, Q
+        bool operator== (const EqBand& o) const noexcept
+        {
+            return on == o.on && type == o.type && juce::exactlyEqual (freq, o.freq) && juce::exactlyEqual (gain, o.gain) && juce::exactlyEqual (q, o.q);
+        }
+    };
 
     struct EqSettings
     {
-        Values freq {}, gain {}, q {};   // Hz, dB, Q
-        bool operator== (const EqSettings& o) const noexcept   { return freq == o.freq && gain == o.gain && q == o.q; }
+        std::array<EqBand, numBands> band {};
+        bool valid = false;   // read from the parameters
+        bool operator== (const EqSettings& o) const noexcept   { return valid == o.valid && band == o.band; }
         bool operator!= (const EqSettings& o) const noexcept   { return ! (*this == o); }
     };
-
-    enum class EqType { lowShelf, bell, highShelf };
-    inline constexpr EqType eqTypes[numBands] { EqType::lowShelf, EqType::bell, EqType::bell, EqType::bell, EqType::bell, EqType::highShelf };
-    inline constexpr float eqDefaultFreq[numBands] { 60.0f, 200.0f, 600.0f, 2000.0f, 5000.0f, 12000.0f };
 
     // Magnitude of one band at f (analog prototypes: no cramping near Nyquist)
     inline float bandMagnitude (EqType type, float f0, float gainDb, float q, float f)
@@ -75,8 +84,9 @@ namespace Tone
     inline float eqMagnitude (const EqSettings& s, float f)
     {
         float m = 1.0f;
-        for (size_t b = 0; b < (size_t) numBands; ++b)
-            m *= bandMagnitude (eqTypes[b], s.freq[b], s.gain[b], s.q[b], f);
+        for (const auto& b : s.band)
+            if (b.on)
+                m *= bandMagnitude (b.type, b.freq, b.gain, b.q, f);
         return m;
     }
 

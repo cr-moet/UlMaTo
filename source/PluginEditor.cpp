@@ -102,11 +102,13 @@ UlMaToEditor::UlMaToEditor (UlMaToProcessor& p)
     const auto setUpKnob = [&] (LabelledKnob& k, const char* id, const juce::String& text) { setUpKnobOn (MatchEngine::analogStage, k, id, text); };
     for (size_t b = 0; b < tapeKnobs.size(); ++b)
         setUpKnob (tapeKnobs[b], ParamIDs::tape[b], juce::String (Dynamics::bandNames[b]) + "\n" + Dynamics::bandRanges[b]);
-    setUpKnob (heatKnobs[0], ParamIDs::wow,         "WOW");
-    setUpKnob (heatKnobs[1], ParamIDs::flutter,     "FLUTTER");
-    setUpKnob (heatKnobs[2], ParamIDs::crackle,     "VINYL CRACKLE");
-    setUpKnob (heatKnobs[3], ParamIDs::tube,        "TUBE STAGE");
-    setUpKnob (heatKnobs[4], ParamIDs::transformer, "TRANSFORMER");
+    setUpKnob (heatKnobs[0], ParamIDs::wowDepth,     "WOW DEPTH");
+    setUpKnob (heatKnobs[1], ParamIDs::wowRate,      "WOW RATE");
+    setUpKnob (heatKnobs[2], ParamIDs::flutterDepth, "FLUTTER DEPTH");
+    setUpKnob (heatKnobs[3], ParamIDs::flutterRate,  "FLUTTER RATE");
+    setUpKnob (heatKnobs[4], ParamIDs::crackle,      "VINYL CRACKLE");
+    setUpKnob (heatKnobs[5], ParamIDs::tube,         "TUBE STAGE");
+    setUpKnob (heatKnobs[6], ParamIDs::transformer,  "TRANSFORMER");
     for (auto& k : tapeKnobs)
         k.label.setFont (juce::Font (juce::FontOptions (12.0f, juce::Font::bold)));
 
@@ -255,7 +257,7 @@ void UlMaToEditor::paint (juce::Graphics& g)
     // Analog heat: titles of the three groups (right of the upper left screw)
     if (currentPage == MatchEngine::analogStage)
         for (auto [r, title] : { std::pair { tapePanel, "TAPE SATURATION PER BAND  (stereo: random drive per sample, left and right)" },
-                                 std::pair { transportPanel, "TAPE TRANSPORT / VINYL" },
+                                 std::pair { transportPanel, "TAPE TRANSPORT (WOW: PITCH, FLUTTER: LEVEL) / VINYL" },
                                  std::pair { outputPanel, "OUTPUT STAGES" } })
         {
             g.setColour (Colours::text);
@@ -302,7 +304,7 @@ void UlMaToEditor::resized()
         auto page = area;
         tapePanel = page.removeFromTop (page.getHeight() / 2 - 6);
         page.removeFromTop (12);
-        transportPanel = page.removeFromLeft (page.getWidth() * 3 / 5 - 6);
+        transportPanel = page.removeFromLeft (page.getWidth() * 5 / 7 - 6);
         page.removeFromLeft (12);
         outputPanel = page;
         for (auto r : { tapePanel, transportPanel, outputPanel })
@@ -320,8 +322,8 @@ void UlMaToEditor::resized()
             }
         };
         placeRow (tapePanel, tapeKnobs, 0, tapeKnobs.size());
-        placeRow (transportPanel, heatKnobs, 0, 3);
-        placeRow (outputPanel, heatKnobs, 3, 2);
+        placeRow (transportPanel, heatKnobs, 0, 5);
+        placeRow (outputPanel, heatKnobs, 5, 2);
     }
 
     // PhaseQ and graphic EQ pages: the graph

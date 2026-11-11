@@ -3,6 +3,13 @@
 
 namespace
 {
+    // Rate of wow / flutter in Hz for the setting -50 ... +50 (0: the reference machine);
+    // wow 0.2 ... 0.8 ... 10 Hz, flutter 1.3 ... 5.15 ... 20 Hz
+    float transportRate (bool wow, float setting)
+    {
+        const float reference = wow ? 0.8f : 5.15f, top = wow ? 12.5f : 4.0f;
+        return reference * std::pow (setting < 0.0f ? 4.0f : top, setting / 50.0f);
+    }
     const juce::Identifier fileProperty ("referenceFile"), startProperty ("rangeStart"),
                            endProperty ("rangeEnd"), profileProperty ("referenceProfile"),
                            learnedProperty ("learnedProfile"), referenceDynamicsProperty ("referenceDynamics"),
@@ -73,8 +80,10 @@ UlMaToProcessor::UlMaToProcessor()
     bypassParam   = dynamic_cast<juce::AudioParameterBool*> (apvts.getParameter (ParamIDs::bypass));
     for (size_t b = 0; b < tapeParams.size(); ++b)
         tapeParams[b] = apvts.getRawParameterValue (ParamIDs::tape[b]);
-    wowParam         = apvts.getRawParameterValue (ParamIDs::wow);
-    flutterParam     = apvts.getRawParameterValue (ParamIDs::flutter);
+    wowDepthParam     = apvts.getRawParameterValue (ParamIDs::wowDepth);
+    wowRateParam      = apvts.getRawParameterValue (ParamIDs::wowRate);
+    flutterDepthParam = apvts.getRawParameterValue (ParamIDs::flutterDepth);
+    flutterRateParam  = apvts.getRawParameterValue (ParamIDs::flutterRate);
     crackleParam     = apvts.getRawParameterValue (ParamIDs::crackle);
     tubeParam        = apvts.getRawParameterValue (ParamIDs::tube);
     transformerParam = apvts.getRawParameterValue (ParamIDs::transformer);
@@ -114,8 +123,36 @@ juce::AudioProcessorValueTreeState::ParameterLayout UlMaToProcessor::createParam
     addPercent (ParamIDs::dynamics, "Dynamics Match", 50.0f);
     for (int b = 0; b < Dynamics::numBands; ++b)
         addPercent (ParamIDs::tape[b], juce::String ("Tape ") + Dynamics::bandNames[b], 0.0f);
-    addPercent (ParamIDs::wow,         "Wow",         0.0f);
-    addPercent (ParamIDs::flutter,     "Flutter",     0.0f);
+    // Wow / flutter: depth 0 % (off) ... 100 %, rising with the square (about 10 - 15 % is the
+    // reference machine); rate -50 ... 0 (reference) ... +50, shown in Hz
+    const auto depthText = [] (float v, int) { return v < 0.05f ? juce::String ("Off") : juce::String (v, 1) + " %"; };
+    const auto depthValue = [] (const juce::String& t) { return t.trim().equalsIgnoreCase ("off") ? 0.0f : t.getFloatValue(); };
+    for (auto [id, rateId, name] : { std::tuple { ParamIDs::wowDepth, ParamIDs::wowRate, "Wow" }, std::tuple { ParamIDs::flutterDepth, ParamIDs::flutterRate, "Flutter" } })
+    {
+        layout.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { id, 1 }, juce::String (name) + " Depth",
+                                                                 juce::NormalisableRange<float> (0.0f, 100.0f, 0.1f), 0.0f,
+                                                                 juce::AudioParameterFloatAttributes().withLabel ("%")
+                                                                                                       .withStringFromValueFunction (depthText)
+                                                                                                       .withValueFromStringFunction (depthValue)));
+        const bool wow = id == ParamIDs::wowDepth;
+        const auto rateText = [wow] (float v, int) { return juce::String (transportRate (wow, v), 2) + " Hz"; };
+        const auto rateValue = [wow] (const juce::String& t)
+        {
+            if (! t.containsIgnoreCase ("hz"))
+                return t.getFloatValue();
+            float lo = -50.0f, hi = 50.0f;   // the rate is monotonic: find the setting by bisection
+            for (int i = 0; i < 40; ++i)
+            {
+                const float mid = 0.5f * (lo + hi);
+                (transportRate (wow, mid) < t.getFloatValue() ? lo : hi) = mid;
+            }
+            return 0.5f * (lo + hi);
+        };
+        layout.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { rateId, 1 }, juce::String (name) + " Rate",
+                                                                 juce::NormalisableRange<float> (-50.0f, 50.0f, 0.1f), 0.0f,
+                                                                 juce::AudioParameterFloatAttributes().withStringFromValueFunction (rateText)
+                                                                                                       .withValueFromStringFunction (rateValue)));
+    }
     addPercent (ParamIDs::crackle,     "Vinyl Crackle", 0.0f);
     addPercent (ParamIDs::tube,        "Tube",        0.0f);
     addPercent (ParamIDs::transformer, "Transformer", 0.0f);
@@ -131,12 +168,16 @@ juce::AudioProcessorValueTreeState::ParameterLayout UlMaToProcessor::createParam
     qRange.setSkewForCentre (1.0f);
     for (int b = 0; b < Tone::numBands; ++b)
     {
-        const auto n = juce::String (b + 1);
-        layout.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { ParamIDs::eqFreq[b], 1 }, "EQ " + n + " Freq", freqRange, Tone::eqDefaultFreq[b], hz));
-        layout.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { ParamIDs::eqGain[b], 1 }, "EQ " + n + " Gain",
+        const auto n = "EQ " + juce::String (b + 1);
+        layout.add (std::make_unique<juce::AudioParameterBool> (juce::ParameterID { ParamIDs::eqOn[b], 1 }, n + " On", false));
+        layout.add (std::make_unique<juce::AudioParameterBool> (juce::ParameterID { ParamIDs::eqBypass[b], 1 }, n + " Bypass", false));
+        layout.add (std::make_unique<juce::AudioParameterChoice> (juce::ParameterID { ParamIDs::eqType[b], 1 }, n + " Type", juce::StringArray { "Bell", "Low Shelf", "High Shelf" }, 0));
+        layout.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { ParamIDs::eqFreq[b], 1 }, n + " Freq", freqRange, 1000.0f, hz));
+        layout.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { ParamIDs::eqGain[b], 1 }, n + " Gain",
                                                                  juce::NormalisableRange<float> (-18.0f, 18.0f, 0.01f), 0.0f, db));
-        layout.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { ParamIDs::eqQ[b], 1 }, "EQ " + n + " Q", qRange,
-                                                                 Tone::eqTypes[b] == Tone::EqType::bell ? 1.0f : 0.71f));
+        layout.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { ParamIDs::eqQ[b], 1 }, n + " Q", qRange, 1.0f,
+                                                                 juce::AudioParameterFloatAttributes()
+                                                                     .withStringFromValueFunction ([] (float v, int) { return juce::String (v, 2); })));
     }
 
     // PhaseQ: left and right
@@ -255,8 +296,11 @@ MatchEngine::StageSettings UlMaToProcessor::readStageSettings() const
     MatchEngine::StageSettings s;
     for (size_t b = 0; b < tapeParams.size(); ++b)
         s.analog.tape[b] = tapeParams[b]->load() * 0.01f;
-    s.analog.wow         = wowParam->load() * 0.01f;
-    s.analog.flutter     = flutterParam->load() * 0.01f;
+    const auto depth = [] (float percent) { const float x = 0.01f * percent; return x * x; };   // 0 ... 1, square law
+    s.analog.wowDepth     = depth (wowDepthParam->load());
+    s.analog.flutterDepth = depth (flutterDepthParam->load());
+    s.analog.wowRate      = transportRate (true, wowRateParam->load());
+    s.analog.flutterRate  = transportRate (false, flutterRateParam->load());
     s.analog.crackle     = crackleParam->load() * 0.01f;
     s.analog.tube        = tubeParam->load() * 0.01f;
     s.analog.transformer = transformerParam->load() * 0.01f;
@@ -264,10 +308,14 @@ MatchEngine::StageSettings UlMaToProcessor::readStageSettings() const
     const auto value = [this] (const char* id) { return apvts.getRawParameterValue (id)->load(); };
     for (size_t b = 0; b < (size_t) Tone::numBands; ++b)
     {
-        s.eq.freq[b] = value (ParamIDs::eqFreq[b]);
-        s.eq.gain[b] = value (ParamIDs::eqGain[b]);
-        s.eq.q[b]    = value (ParamIDs::eqQ[b]);
+        auto& band = s.eq.band[b];
+        band.on    = value (ParamIDs::eqOn[b]) > 0.5f && value (ParamIDs::eqBypass[b]) < 0.5f;
+        band.type  = (Tone::EqType) juce::roundToInt (value (ParamIDs::eqType[b]));
+        band.freq  = value (ParamIDs::eqFreq[b]);
+        band.gain  = value (ParamIDs::eqGain[b]);
+        band.q     = value (ParamIDs::eqQ[b]);
     }
+    s.eq.valid = true;
     for (size_t n = 0; n < (size_t) Tone::numPhaseNodes; ++n)
     {
         auto& node   = s.phase.node[n];
