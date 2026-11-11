@@ -426,11 +426,7 @@ public:
 
     void paint (juce::Graphics& g) override
     {
-        const auto r = getLocalBounds().toFloat().reduced (0.5f);
-        g.setColour (Colours::text.withAlpha (0.06f));
-        g.fillRoundedRectangle (r, 4.0f);
-        g.setColour (Colours::text.withAlpha (0.45f));
-        g.drawRoundedRectangle (r, 4.0f, 1.0f);
+        Plot::drawScrewedPanel (g, getLocalBounds().toFloat().withTrimmedRight (4.0f).withTrimmedBottom (5.0f), 4.5f);
         g.setColour (Colours::text);
         if (node >= 0)
         {
@@ -441,13 +437,13 @@ public:
         {
             g.setColour (Colours::text.withAlpha (0.6f));
             g.setFont (juce::Font (juce::FontOptions (12.0f)));
-            g.drawText ("no node selected  -  double-click into the display to create one", getLocalBounds().reduced (12, 0), juce::Justification::centredLeft);
+            g.drawText ("no node selected  -  double-click into the display to create one", getLocalBounds().reduced (26, 0), juce::Justification::centredLeft);
         }
     }
 
     void resized() override
     {
-        auto r = getLocalBounds().reduced (8, 6);
+        auto r = getLocalBounds().withTrimmedRight (4).withTrimmedBottom (5).reduced (22, 5);
         const auto gap = [&r] (int w) { r.removeFromLeft (w); };
         removeButton.setBounds (r.removeFromRight (32).withSizeKeepingCentre (30, 30));
         nameArea = r.removeFromLeft (44);
@@ -549,7 +545,7 @@ public:
     void resized() override
     {
         NodeEditor::resized();
-        strip.setBounds (getLocalBounds().removeFromBottom (62).withTrimmedLeft ((int) plot.getX()).withTrimmedRight (4));
+        strip.setBounds (getLocalBounds().removeFromBottom (66).withTrimmedLeft ((int) plot.getX()));
     }
 
     void mouseDoubleClick (const juce::MouseEvent& e) override

@@ -247,16 +247,20 @@ void UlMaToEditor::paint (juce::Graphics& g)
     g.setColour (Colours::text);
     g.fillRect (tabLine);
 
-    // Analog heat: three groups
+    // Raised panels screwed onto the front around the controls of the page
+    for (const auto& [page, r] : controlPanels)
+        if (page == currentPage)
+            Plot::drawScrewedPanel (g, r.toFloat());
+
+    // Analog heat: titles of the three groups (right of the upper left screw)
     if (currentPage == MatchEngine::analogStage)
         for (auto [r, title] : { std::pair { tapePanel, "TAPE SATURATION PER BAND  (stereo: random drive per sample, left and right)" },
                                  std::pair { transportPanel, "TAPE TRANSPORT / VINYL" },
                                  std::pair { outputPanel, "OUTPUT STAGES" } })
         {
-            Plot::drawPanel (g, r.toFloat());
             g.setColour (Colours::text);
             g.setFont (juce::Font (juce::FontOptions (12.0f, juce::Font::bold)));
-            g.drawText (title, r.reduced (10, 6).removeFromTop (16), juce::Justification::centredLeft);
+            g.drawText (title, r.reduced (30, 9).removeFromTop (16), juce::Justification::centredLeft);
         }
 }
 
@@ -286,6 +290,13 @@ void UlMaToEditor::resized()
     tabLine = area.removeFromTop (2);
     area.removeFromTop (12);
 
+    controlPanels.clear();
+    const auto panel = [this] (int page, juce::Rectangle<int> r, int padding)
+    {
+        controlPanels.push_back ({ page, r });
+        return r.reduced (padding);
+    };
+
     // Analog heat page: tape knobs in a row, below transport / vinyl and the output stages
     {
         auto page = area;
@@ -294,10 +305,12 @@ void UlMaToEditor::resized()
         transportPanel = page.removeFromLeft (page.getWidth() * 3 / 5 - 6);
         page.removeFromLeft (12);
         outputPanel = page;
+        for (auto r : { tapePanel, transportPanel, outputPanel })
+            panel (MatchEngine::analogStage, r, 0);
 
         const auto placeRow = [] (juce::Rectangle<int> r, auto& knobs, size_t first, size_t count)
         {
-            r = r.reduced (10).withTrimmedTop (22);
+            r = r.reduced (24, 12).withTrimmedTop (20);
             const int w = r.getWidth() / (int) count;
             for (size_t i = first; i < first + count; ++i)
             {
@@ -318,8 +331,8 @@ void UlMaToEditor::resized()
     // Limiter page: history above, controls below
     {
         auto page = area;
-        auto knobRow = page.removeFromBottom (juce::jmin (210, page.getHeight() / 2));
-        page.removeFromBottom (12);
+        auto knobRow = panel (MatchEngine::limiterStage, page.removeFromBottom (juce::jmin (230, page.getHeight() / 2)), 22);
+        page.removeFromBottom (14);
         limiterView.setBounds (page);
 
         auto buttons = knobRow.removeFromRight (180).withSizeKeepingCentre (160, 90);
@@ -339,7 +352,7 @@ void UlMaToEditor::resized()
     // Dynamics page: the bands, the DYNAMICS knob on the right
     {
         auto page = area;
-        auto knob = page.removeFromRight (200);
+        auto knob = panel (MatchEngine::dynamicsStage, page.removeFromRight (220), 22);
         page.removeFromRight (16);
         dynamicsView.setBounds (page);
         dynamicsLabel.setBounds (knob.removeFromTop (24));
@@ -359,7 +372,7 @@ void UlMaToEditor::resized()
     area.removeFromTop (14);
 
     // Live spectrum, next to it MATCH (large) and RESPONSE (small) side by side
-    auto knobs = area.removeFromRight (330);
+    auto knobs = panel (MatchEngine::eqStage, area.removeFromRight (350), 20);
     area.removeFromRight (16);
     liveView.setBounds (area);
 

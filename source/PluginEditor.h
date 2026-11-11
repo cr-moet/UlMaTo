@@ -71,6 +71,7 @@ private:
     std::array<LabelledKnob, Dynamics::numBands> tapeKnobs;
     std::array<LabelledKnob, 5> heatKnobs;   // wow, flutter, crackle, tube, transformer
     juce::Rectangle<int> tapePanel, transportPanel, outputPanel;
+    std::vector<std::pair<int, juce::Rectangle<int>>> controlPanels;   // page, raised screwed panel around its controls
 
     // PhaseQ, graphic EQ, limiter pages
     // PhaseQ: one graph for both channels, with the box of the selected node inside
