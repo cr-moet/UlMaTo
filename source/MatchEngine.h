@@ -75,6 +75,9 @@ public:
     // Limiter meters (any thread)
     float getLimiterReductionDb() const noexcept   { return limiter.getGainReductionDb(); }
     float getLimiterOutputDb() const noexcept      { return limiter.getOutputPeakDb(); }
+    Limit::Meters getLimiterMeters() const noexcept   { return limiter.getMeters(); }
+    int readLimiterColumns (Limit::Column* destination, int maxCount) noexcept   { return limiter.readColumns (destination, maxCount); }
+    void resetLimiterLoudness() noexcept           { limiter.resetLoudness(); }
 
     // Profiles (any thread except audio)
     void setReference (const Spectrum::Profile& reference);

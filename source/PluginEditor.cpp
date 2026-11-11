@@ -122,17 +122,54 @@ UlMaToEditor::UlMaToEditor (UlMaToProcessor& p)
 
     // Limiter
     addChildComponent (limiterView);
-    setUpKnobOn (MatchEngine::limiterStage, limiterKnobs[0], ParamIDs::limiterInput,   "INPUT GAIN");
-    setUpKnobOn (MatchEngine::limiterStage, limiterKnobs[1], ParamIDs::limiterCeiling, "CEILING");
-    setUpKnobOn (MatchEngine::limiterStage, limiterKnobs[2], ParamIDs::limiterRelease, "RELEASE");
-    setUpKnobOn (MatchEngine::limiterStage, limiterKnobs[3], ParamIDs::limiterLink,    "STEREO LINK");
-    for (auto* b : { &limiterOnButton, &truePeakButton })
     {
-        b->setClickingTogglesState (true);
-        b->getProperties().set ("led", true);
-        addChildComponent (b);
+        const std::pair<const char*, const char*> knobs[] { { ParamIDs::limiterInput, "GAIN" }, { ParamIDs::limiterCeiling, "OUTPUT" },
+                                                            { ParamIDs::limiterLookahead, "LOOKAHEAD" }, { ParamIDs::limiterAttack, "ATTACK" },
+                                                            { ParamIDs::limiterRelease, "RELEASE" }, { ParamIDs::limiterLink, "LINK\nTRANSIENTS" },
+                                                            { ParamIDs::limiterLinkRelease, "LINK\nRELEASE" } };
+        for (size_t i = 0; i < limiterKnobs.size(); ++i)
+            setUpKnobOn (MatchEngine::limiterStage, limiterKnobs[i], knobs[i].first, knobs[i].second);
+
+        const std::pair<const char*, const char*> buttons[] { { ParamIDs::limiterOn, "LIMITER ON" }, { ParamIDs::limiterTruePeak, "TRUE PEAK" },
+                                                              { ParamIDs::limiterDc, "DC FILTER" }, { ParamIDs::limiterUnity, "UNITY GAIN" },
+                                                              { ParamIDs::limiterAutoRelease, "AUTO" } };
+        for (size_t i = 0; i < limiterButtons.size(); ++i)
+        {
+            auto& b = limiterButtons[i];
+            b.setButtonText (buttons[i].second);
+            b.setClickingTogglesState (true);
+            b.getProperties().set ("led", true);
+            limiterButtonAttachments[i] = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (processorRef.apvts, buttons[i].first, b);
+            addChildComponent (b);
+            pages[MatchEngine::limiterStage].push_back (&b);
+        }
+        limiterButtons[4].setTooltip ("Automatic release: fast after transients, slow while it keeps limiting");
+        auto& truePeak = limiterButtons[1];   // TRUE PEAK when on (LED lit), RMS when off
+        truePeak.onStateChange = [&truePeak] { truePeak.setButtonText (truePeak.getToggleState() ? "TRUE PEAK" : "RMS"); };
+        truePeak.onStateChange();
+        auto& autoRelease = limiterButtons[4];   // AUTO: the release knob is not used
+        autoRelease.onStateChange = [this, &autoRelease] { limiterKnobs[4].knob.setAlpha (autoRelease.getToggleState() ? 0.35f : 1.0f); };
+        autoRelease.onStateChange();
+
+        const std::pair<const char*, const char*> menus[] { { ParamIDs::limiterOversampling, "OVERSAMPLING" },
+                                                            { ParamIDs::limiterDither, "DITHER" }, { ParamIDs::limiterShaping, "NOISE SHAPING" } };
+        for (size_t i = 0; i < limiterMenus.size(); ++i)
+        {
+            auto& m = limiterMenus[i];
+            if (auto* choice = dynamic_cast<juce::AudioParameterChoice*> (processorRef.apvts.getParameter (menus[i].first)))
+                for (int c = 0; c < choice->choices.size(); ++c)
+                    m.addItem (choice->choices[c].toUpperCase(), c + 1);
+            limiterMenuAttachments[i] = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (processorRef.apvts, menus[i].first, m);
+            auto& l = limiterMenuLabels[i];
+            l.setText (menus[i].second, juce::dontSendNotification);
+            l.setFont (juce::Font (juce::FontOptions (11.0f, juce::Font::bold)));
+            l.setJustificationType (juce::Justification::bottomLeft);
+            addChildComponent (m);
+            addChildComponent (l);
+            pages[MatchEngine::limiterStage].insert (pages[MatchEngine::limiterStage].end(), { &m, &l });
+        }
+        pages[MatchEngine::limiterStage].push_back (&limiterView);
     }
-    pages[MatchEngine::limiterStage].insert (pages[MatchEngine::limiterStage].end(), { &limiterView, &limiterOnButton, &truePeakButton });
 
     matchInfo.setFont (juce::Font (juce::FontOptions (11.0f)));
     matchInfo.setJustificationType (juce::Justification::centred);
@@ -333,21 +370,40 @@ void UlMaToEditor::resized()
     // Limiter page: history above, controls below
     {
         auto page = area;
-        auto knobRow = panel (MatchEngine::limiterStage, page.removeFromBottom (juce::jmin (230, page.getHeight() / 2)), 22);
+        auto limiterArea = panel (MatchEngine::limiterStage, page.removeFromBottom (juce::jmin (220, page.getHeight() / 2)), 18);
         page.removeFromBottom (14);
         limiterView.setBounds (page);
 
-        auto buttons = knobRow.removeFromRight (180).withSizeKeepingCentre (160, 90);
-        limiterOnButton.setBounds (buttons.removeFromTop (40));
-        buttons.removeFromTop (10);
-        truePeakButton.setBounds (buttons.removeFromTop (40));
-
-        const int w = knobRow.getWidth() / (int) limiterKnobs.size();
-        for (auto& k : limiterKnobs)
+        // Right: buttons, then the menus; left: the knobs (AUTO above the release knob)
+        auto buttons = limiterArea.removeFromRight (130);
+        const int bh = juce::jmin (34, (buttons.getHeight() - 3 * 8) / 4);
+        for (size_t i = 0; i < 4; ++i)
         {
-            auto cell = knobRow.removeFromLeft (w);
-            k.label.setBounds (cell.removeFromTop (22));
-            k.knob.setBounds (cell.withSizeKeepingCentre (juce::jmin (cell.getWidth(), 160), juce::jmin (cell.getHeight(), 170)));
+            limiterButtons[i].setBounds (buttons.removeFromTop (bh));
+            buttons.removeFromTop (8);
+        }
+        limiterArea.removeFromRight (14);
+        auto menus = limiterArea.removeFromRight (150);
+        const int mh = menus.getHeight() / 3;
+        for (size_t i = 0; i < limiterMenus.size(); ++i)
+        {
+            auto cell = menus.removeFromTop (mh).withSizeKeepingCentre (menus.getWidth(), 48);
+            limiterMenuLabels[i].setBounds (cell.removeFromTop (16));
+            limiterMenus[i].setBounds (cell.removeFromTop (28));
+        }
+        limiterArea.removeFromRight (12);
+
+        const int w = limiterArea.getWidth() / (int) limiterKnobs.size();
+        for (size_t i = 0; i < limiterKnobs.size(); ++i)
+        {
+            auto& k = limiterKnobs[i];
+            auto cell = limiterArea.removeFromLeft (w);
+            if (i == 4)
+                limiterButtons[4].setBounds (cell.removeFromTop (26).withSizeKeepingCentre (70, 24));
+            else
+                cell.removeFromTop (26);
+            k.label.setBounds (cell.removeFromTop (26));
+            k.knob.setBounds (cell.withSizeKeepingCentre (juce::jmin (cell.getWidth(), 112), juce::jmin (cell.getHeight(), 126)));
         }
     }
 

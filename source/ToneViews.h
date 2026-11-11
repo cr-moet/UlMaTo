@@ -719,7 +719,8 @@ protected:
 };
 
 //==============================================================================
-// Limiter: gain reduction and output peak over the last 4 seconds, current values
+// Limiter: scrolling history (input, output, gain reduction from the top), level meters
+// and the loudness of the output
 //==============================================================================
 class LimiterView final : public juce::Component,
                           private juce::Timer
@@ -727,9 +728,8 @@ class LimiterView final : public juce::Component,
 public:
     explicit LimiterView (UlMaToProcessor& p) : processor (p)
     {
-        reductionHistory.fill (0.0f);
-        outputHistory.fill (-100.0f);
-        startTimerHz (rate);
+        history.fill ({});
+        startTimerHz (60);
     }
 
     void paint (juce::Graphics& g) override
@@ -737,85 +737,211 @@ public:
         auto r = getLocalBounds().toFloat();
         g.setColour (Colours::text);
         g.setFont (juce::Font (juce::FontOptions (12.0f, juce::Font::bold)));
-        g.drawText ("LIMITER  -  output peak and gain reduction, last 4 s", r.removeFromTop (18.0f), juce::Justification::centredLeft);
+        g.drawText ("LIMITER  -  input (light), output (dark) and gain reduction (red, from the top)", r.removeFromTop (18.0f), juce::Justification::centredLeft);
 
-        auto numbers = r.removeFromRight (190.0f);
-        r.removeFromRight (12.0f);
-        const auto plot = r.withTrimmedLeft (40.0f).withTrimmedBottom (4.0f);
+        auto side = r.removeFromRight (300.0f);
+        r.removeFromRight (14.0f);
+        plot = r.withTrimmedLeft (34.0f).withTrimmedBottom (2.0f);
         Plot::drawDisplay (g, plot);
+        drawHistory (g);
+        drawMeters (g, side);
+    }
 
-        // Level scale 0 ... -24 dB (output peak from below, reduction from the top)
-        constexpr float range = 24.0f;
-        const auto yOf = [&] (float db) { return plot.getY() + plot.getHeight() * juce::jlimit (0.0f, 1.0f, -db / range); };
+    // Click on the loudness numbers: reset (integrated, range, true peak)
+    void mouseDown (const juce::MouseEvent& e) override
+    {
+        if (numbersArea.contains (e.position))
+        {
+            processor.resetLimiterLoudness();
+            peakHold = {};
+        }
+    }
+
+private:
+    static constexpr float range = 30.0f;   // dB shown: 0 ... -30
+    static constexpr int numColumns = 2048;
+
+    float yOf (float db) const   { return plot.getY() + plot.getHeight() * juce::jlimit (0.0f, 1.0f, -db / range); }
+
+    void drawHistory (juce::Graphics& g)
+    {
         g.setFont (juce::Font (juce::FontOptions (10.0f)));
         for (float db = 0.0f; db >= -range; db -= 3.0f)
         {
             g.setColour (db == 0.0f ? Colours::text.withAlpha (0.35f) : Colours::grid);
             g.drawHorizontalLine ((int) yOf (db), plot.getX(), plot.getRight());
             g.setColour (Colours::text.withAlpha (0.6f));
-            g.drawText (juce::String (db, 0), juce::Rectangle<float> (plot.getX() - 42.0f, yOf (db) - 6.0f, 38.0f, 12.0f),
-                        juce::Justification::centredRight);
+            g.drawText (juce::String (db, 0), juce::Rectangle<float> (plot.getX() - 36.0f, yOf (db) - 6.0f, 32.0f, 12.0f), juce::Justification::centredRight);
         }
+
+        // One column per pixel, newest on the right; areas as paths (no gaps, no steps)
+        const int count = juce::jmin (numColumns, (int) plot.getWidth());
+        const auto columnAt = [&] (int i) -> const Limit::Column& { return history[(size_t) ((written - count + i + numColumns * 2) % numColumns)]; };
+        const auto db = [] (float v) { return juce::Decibels::gainToDecibels (v, -100.0f); };
+        const auto area = [&] (auto level, bool fromTop)
+        {
+            juce::Path p;
+            const float base = fromTop ? plot.getY() : plot.getBottom();
+            p.startNewSubPath (plot.getRight() - (float) count, base);
+            for (int i = 0; i < count; ++i)
+                p.lineTo (plot.getRight() - (float) (count - i) + 0.5f, yOf (level (columnAt (i))));
+            p.lineTo (plot.getRight(), base);
+            p.closeSubPath();
+            return p;
+        };
+        juce::Graphics::ScopedSaveState state (g);
+        g.reduceClipRegion (plot.toNearestInt());
+        g.setColour (Colours::display.brighter (0.45f));                               // input
+        g.fillPath (area ([&] (const Limit::Column& c) { return db (c.input); }, false));
+        g.setColour (Colours::text.withAlpha (0.55f));                                // output
+        g.fillPath (area ([&] (const Limit::Column& c) { return db (c.output); }, false));
+        g.setColour (Colours::accent.withAlpha (0.85f));                              // gain reduction, from the top
+        g.fillPath (area ([] (const Limit::Column& c) { return c.reduction; }, true));
+        g.setColour (Colours::accent.darker (0.3f));
+        g.strokePath (area ([] (const Limit::Column& c) { return c.reduction; }, true), juce::PathStrokeType (1.0f));
 
         const float ceiling = processor.apvts.getRawParameterValue (ParamIDs::limiterCeiling)->load();
-        const int count = (int) reductionHistory.size();
-        const float w = plot.getWidth() / (float) count;
-        for (int i = 0; i < count; ++i)
-        {
-            const auto index = (size_t) ((writePosition + i) % count);
-            const float x = plot.getX() + (float) i * w;
-            g.setColour (Colours::text.withAlpha (0.25f));   // output peak
-            g.fillRect (juce::Rectangle<float>::leftTopRightBottom (x, yOf (outputHistory[index]), x + w, plot.getBottom()));
-            g.setColour (Colours::accent);                   // reduction
-            g.fillRect (juce::Rectangle<float>::leftTopRightBottom (x, plot.getY(), x + w, yOf (reductionHistory[index])));
-        }
+        juce::Path line;
+        line.startNewSubPath (plot.getX(), yOf (ceiling));
+        line.lineTo (plot.getRight(), yOf (ceiling));
+        juce::Path dashed;
+        const float dashes[] { 6.0f, 4.0f };
+        juce::PathStrokeType (1.2f).createDashedStroke (dashed, line, dashes, 2);
         g.setColour (Colours::correlation);
-        g.drawHorizontalLine ((int) yOf (ceiling), plot.getX(), plot.getRight());
-
-        // Numbers
-        const auto row = [&] (const juce::String& label, const juce::String& text, juce::Colour colour)
-        {
-            auto line = numbers.removeFromTop (44.0f);
-            g.setColour (Colours::text.withAlpha (0.7f));
-            g.setFont (juce::Font (juce::FontOptions (11.0f)));
-            g.drawText (label, line.removeFromTop (16.0f), juce::Justification::centredLeft);
-            auto box = line.removeFromTop (24.0f);
-            g.setColour (Colours::text);
-            g.fillRect (box);
-            g.setColour (colour);
-            g.setFont (juce::Font (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(), 15.0f, juce::Font::bold)));
-            g.drawText (text, box.reduced (8.0f, 0.0f), juce::Justification::centredRight);
-        };
-        numbers.removeFromTop (4.0f);
-        const auto reductionText = [] (float db) { return (db < -0.05f ? juce::String (db, 1) : juce::String ("0.0")) + " dB"; };
-        row ("GAIN REDUCTION", reductionText (current), Colours::accent);
-        row ("MAX REDUCTION (click to reset)", reductionText (maximum), Colours::accent);
-        row ("OUTPUT PEAK", juce::String (juce::jmax (-99.9f, peak), 1) + " dBFS", Colours::background);
-        row ("CEILING", juce::String (ceiling, 2) + " dBFS", Colours::correlation);
+        g.fillPath (dashed);
+        g.setFont (juce::Font (juce::FontOptions (10.0f, juce::Font::bold)));
+        g.drawText ("CEILING " + juce::String (ceiling, 1), juce::Rectangle<float> (plot.getX() + 6.0f, yOf (ceiling) + 2.0f, 120.0f, 12.0f), juce::Justification::centredLeft);
     }
 
-    void mouseDown (const juce::MouseEvent&) override   { maximum = 0.0f; peak = -100.0f; repaint(); }
+    // Level meters (input L / R, reduction, output L / R) and the loudness numbers
+    void drawMeters (juce::Graphics& g, juce::Rectangle<float> r)
+    {
+        const float ceilingDb = processor.apvts.getRawParameterValue (ParamIDs::limiterCeiling)->load();
+        const bool truePeakOn = processor.apvts.getRawParameterValue (ParamIDs::limiterTruePeak)->load() > 0.5f;
+        auto bars = r.removeFromTop (r.getHeight() * 0.55f);
+        const auto scale = bars.removeFromLeft (26.0f);
+        auto meterArea = bars.withTrimmedBottom (16.0f);
+        Plot::drawDisplay (g, meterArea);
+        const auto yIn = [&] (float d) { return meterArea.getY() + meterArea.getHeight() * juce::jlimit (0.0f, 1.0f, -d / 48.0f); };
+        g.setFont (juce::Font (juce::FontOptions (9.5f)));
+        for (float d = 0.0f; d >= -48.0f; d -= 6.0f)
+        {
+            g.setColour (Colours::text.withAlpha (0.6f));
+            g.drawText (juce::String (d, 0), juce::Rectangle<float> (scale.getX(), yIn (d) - 6.0f, 22.0f, 12.0f), juce::Justification::centredRight);
+            g.setColour (Colours::grid);
+            g.drawHorizontalLine ((int) yIn (d), meterArea.getX(), meterArea.getRight());
+        }
 
-private:
-    static constexpr int rate = 50;
+        // OUT L / R: true peak (light) and RMS (dark) in the same bar; GR from the top; LUFS:
+        // momentary bar, short term mark, integrated line
+        const float w = meterArea.getWidth() / 4.0f;
+        const auto cellOf = [&] (int i) { return juce::Rectangle<float> (meterArea.getX() + (float) i * w, meterArea.getY(), w, meterArea.getHeight()).reduced (w * 0.2f, 2.0f); };
+        const float peaks[] { shown.truePeakL, shown.truePeakR }, rms[] { shown.rmsL, shown.rmsR };
+        for (int i = 0; i < 2; ++i)
+        {
+            const auto cell = cellOf (i);
+            g.setColour (Colours::display.brighter (0.45f));
+            g.fillRect (cell.withTop (yIn (peaks[i])));
+            g.setColour (Colours::text.withAlpha (0.75f));
+            g.fillRect (cell.reduced (cell.getWidth() * 0.18f, 0.0f).withTop (yIn (rms[i])));
+            g.setColour (peakHold[(size_t) i] > ceilingDb + 0.05f ? Colours::correlation : Colours::text);
+            g.fillRect (juce::Rectangle<float> (cell.getX(), yIn (peakHold[(size_t) i]) - 1.0f, cell.getWidth(), 2.0f));
+        }
+        g.setColour (Colours::accent);
+        g.fillRect (cellOf (2).withBottom (yIn (shown.reduction)));
+        {
+            const auto cell = cellOf (3);
+            g.setColour (Colours::accent.withAlpha (0.55f));
+            g.fillRect (cell.withTop (yIn (shown.momentary)));
+            g.setColour (Colours::accent);
+            g.fillRect (juce::Rectangle<float> (cell.getX(), yIn (shown.shortTerm) - 1.0f, cell.getWidth(), 2.0f));
+            if (shown.integrated > -70.0f)
+            {
+                g.setColour (Colours::correlation);
+                g.fillRect (juce::Rectangle<float> (cell.getX() - 3.0f, yIn (shown.integrated) - 1.5f, cell.getWidth() + 6.0f, 3.0f));
+            }
+        }
+        const char* names[] { "L", "R", "GR", "LUFS" };
+        g.setColour (Colours::text);
+        g.setFont (juce::Font (juce::FontOptions (10.0f, juce::Font::bold)));
+        for (int i = 0; i < 4; ++i)
+            g.drawText (names[i], juce::Rectangle<float> (meterArea.getX() + (float) i * w, meterArea.getBottom() + 2.0f, w, 12.0f), juce::Justification::centred);
+        g.setFont (juce::Font (juce::FontOptions (9.5f)));
+        g.setColour (Colours::text.withAlpha (0.6f));
+        g.drawText (truePeakOn ? "OUT  TP / RMS" : "OUT  PEAK / RMS", juce::Rectangle<float> (meterArea.getX(), bars.getBottom() - 2.0f, w * 2.0f, 10.0f), juce::Justification::centred);
+
+        // Loudness (output): momentary, short term, integrated, range, true peak
+        r.removeFromTop (12.0f);
+        numbersArea = r;
+        const auto lufs = [] (float v) { return v < -69.9f ? juce::String ("--.-") : juce::String (v, 1); };
+        const std::pair<juce::String, juce::String> rows[] {
+            { "MOMENTARY", lufs (shown.momentary) + " LUFS" }, { "SHORT TERM", lufs (shown.shortTerm) + " LUFS" },
+            { "INTEGRATED", lufs (shown.integrated) + " LUFS" }, { "RANGE", juce::String (shown.range, 1) + " LU" },
+            truePeakOn ? std::pair<juce::String, juce::String> { "TRUE PEAK", (shown.truePeak < -99.0f ? juce::String ("--.-") : juce::String (shown.truePeak, 1)) + " dBTP" }
+                       : std::pair<juce::String, juce::String> { "RMS", (juce::jmax (shown.rmsL, shown.rmsR) < -99.0f ? juce::String ("--.-") : juce::String (juce::jmax (shown.rmsL, shown.rmsR), 1)) + " dB" } };
+        const float h = r.getHeight() / 5.0f;
+        for (const auto& [label, text] : rows)
+        {
+            auto line = r.removeFromTop (h).reduced (0.0f, 2.0f);
+            g.setColour (Colours::text.withAlpha (0.75f));
+            g.setFont (juce::Font (juce::FontOptions (11.0f, juce::Font::bold)));
+            g.drawText (label, line.removeFromLeft (100.0f), juce::Justification::centredLeft);
+            auto box = line.withSizeKeepingCentre (line.getWidth(), juce::jmin (line.getHeight(), 24.0f));
+            g.setColour (Colours::text);
+            g.fillRect (box);
+            g.setColour (label == "TRUE PEAK" && shown.truePeak > ceilingDb + 0.05f
+                             ? Colours::correlation : Colours::accent);
+            g.setFont (juce::Font (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(), 14.0f, juce::Font::bold)));
+            g.drawText (text, box.reduced (8.0f, 0.0f), juce::Justification::centredRight);
+            g.setColour (juce::Colours::black.withAlpha (0.6f));   // set in like a small screen
+            g.drawLine (box.getX(), box.getY() + 0.5f, box.getRight(), box.getY() + 0.5f, 1.0f);
+            g.setColour (juce::Colours::white.withAlpha (0.5f));
+            g.drawLine (box.getX(), box.getBottom() - 0.5f, box.getRight(), box.getBottom() - 0.5f, 1.0f);
+        }
+        g.setColour (Colours::text.withAlpha (0.5f));
+        g.setFont (juce::Font (juce::FontOptions (9.5f)));
+        g.drawText ("click: reset", numbersArea.withHeight (10.0f).translated (0.0f, -11.0f), juce::Justification::centredRight);
+    }
 
     void timerCallback() override
     {
-        const float reduction = processor.getLimiterReductionDb(), output = processor.getLimiterOutputDb();
-        reductionHistory[(size_t) writePosition] = reduction;
-        outputHistory[(size_t) writePosition] = output;
-        writePosition = (writePosition + 1) % (int) reductionHistory.size();
-        current += (reduction < current ? 0.6f : 0.15f) * (reduction - current);
-        maximum = juce::jmin (maximum, reduction);
-        peak = juce::jmax (peak, output);
+        std::array<Limit::Column, 256> fresh;
+        for (int n; (n = processor.readLimiterColumns (fresh.data(), (int) fresh.size())) > 0;)
+            for (int i = 0; i < n; ++i)
+            {
+                history[(size_t) written] = fresh[(size_t) i];
+                written = (written + 1) % numColumns;
+            }
+
+        // Meters: fast up, slower down; peak marks fall 10 dB/s after 1 s
+        const auto m = processor.getLimiterMeters();
+        const auto follow = [] (float& v, float target) { v += (target > v ? 0.6f : 0.12f) * (target - v); };
+        follow (shown.truePeakL, m.truePeakL); follow (shown.truePeakR, m.truePeakR);
+        follow (shown.rmsL, m.rmsL);           follow (shown.rmsR, m.rmsR);
+        shown.reduction += (m.reduction < shown.reduction ? 0.6f : 0.12f) * (m.reduction - shown.reduction);
+        const float levels[] { m.truePeakL, m.truePeakR };
+        for (size_t i = 0; i < 2; ++i)
+        {
+            if (levels[i] >= peakHold[i] || holdTicks[i] <= 0)
+            {
+                if (levels[i] >= peakHold[i]) holdTicks[i] = 60;
+                peakHold[i] = juce::jmax (levels[i], peakHold[i] - 10.0f / 60.0f);
+            }
+            --holdTicks[i];
+        }
+        shown.momentary = m.momentary; shown.shortTerm = m.shortTerm; shown.integrated = m.integrated;
+        shown.range = m.range; shown.truePeak = m.truePeak;
         if (isShowing())
             repaint();
     }
 
     UlMaToProcessor& processor;
-    std::array<float, 4 * rate> reductionHistory, outputHistory;
-    int writePosition = 0;
-    float current = 0.0f, maximum = 0.0f, peak = -100.0f;
+    std::array<Limit::Column, numColumns> history;
+    int written = 0;
+    juce::Rectangle<float> plot, numbersArea;
+    Limit::Meters shown;
+    std::array<float, 2> peakHold { -100.0f, -100.0f };
+    std::array<int, 2> holdTicks {};
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (LimiterView)
 };

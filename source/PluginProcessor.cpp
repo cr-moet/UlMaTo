@@ -3,13 +3,6 @@
 
 namespace
 {
-    // Rate of wow / flutter in Hz for the setting -50 ... +50 (0: the reference machine);
-    // wow 0.2 ... 0.8 ... 10 Hz, flutter 1.3 ... 5.15 ... 20 Hz
-    float transportRate (bool wow, float setting)
-    {
-        const float reference = wow ? 0.8f : 5.15f, top = wow ? 12.5f : 4.0f;
-        return reference * std::pow (setting < 0.0f ? 4.0f : top, setting / 50.0f);
-    }
     const juce::Identifier fileProperty ("referenceFile"), startProperty ("rangeStart"),
                            endProperty ("rangeEnd"), profileProperty ("referenceProfile"),
                            learnedProperty ("learnedProfile"), referenceDynamicsProperty ("referenceDynamics"),
@@ -123,35 +116,23 @@ juce::AudioProcessorValueTreeState::ParameterLayout UlMaToProcessor::createParam
     addPercent (ParamIDs::dynamics, "Dynamics Match", 50.0f);
     for (int b = 0; b < Dynamics::numBands; ++b)
         addPercent (ParamIDs::tape[b], juce::String ("Tape ") + Dynamics::bandNames[b], 0.0f);
-    // Wow / flutter: depth 0 % (off) ... 100 %, rising with the square (about 10 - 15 % is the
-    // reference machine); rate -50 ... 0 (reference) ... +50, shown in Hz
+    // Wow / flutter: depth 0 % (off) ... 100 %, rising with the square; rate in Hz
+    // (wow 0.2 ... 25 Hz, flutter 1 ... 50 Hz, log scale)
     const auto depthText = [] (float v, int) { return v < 0.05f ? juce::String ("Off") : juce::String (v, 1) + " %"; };
     const auto depthValue = [] (const juce::String& t) { return t.trim().equalsIgnoreCase ("off") ? 0.0f : t.getFloatValue(); };
-    for (auto [id, rateId, name] : { std::tuple { ParamIDs::wowDepth, ParamIDs::wowRate, "Wow" }, std::tuple { ParamIDs::flutterDepth, ParamIDs::flutterRate, "Flutter" } })
+    const auto rateText = [] (float v, int) { return juce::String (v, v < 10.0f ? 2 : 1) + " Hz"; };
+    for (auto [id, rateId, name, low, high, standard] : { std::tuple { ParamIDs::wowDepth, ParamIDs::wowRate, "Wow", 0.2f, 25.0f, 0.8f },
+                                                          std::tuple { ParamIDs::flutterDepth, ParamIDs::flutterRate, "Flutter", 1.0f, 50.0f, 5.15f } })
     {
         layout.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { id, 1 }, juce::String (name) + " Depth",
                                                                  juce::NormalisableRange<float> (0.0f, 100.0f, 0.1f), 0.0f,
                                                                  juce::AudioParameterFloatAttributes().withLabel ("%")
                                                                                                        .withStringFromValueFunction (depthText)
                                                                                                        .withValueFromStringFunction (depthValue)));
-        const bool wow = id == ParamIDs::wowDepth;
-        const auto rateText = [wow] (float v, int) { return juce::String (transportRate (wow, v), 2) + " Hz"; };
-        const auto rateValue = [wow] (const juce::String& t)
-        {
-            if (! t.containsIgnoreCase ("hz"))
-                return t.getFloatValue();
-            float lo = -50.0f, hi = 50.0f;   // the rate is monotonic: find the setting by bisection
-            for (int i = 0; i < 40; ++i)
-            {
-                const float mid = 0.5f * (lo + hi);
-                (transportRate (wow, mid) < t.getFloatValue() ? lo : hi) = mid;
-            }
-            return 0.5f * (lo + hi);
-        };
-        layout.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { rateId, 1 }, juce::String (name) + " Rate",
-                                                                 juce::NormalisableRange<float> (-50.0f, 50.0f, 0.1f), 0.0f,
-                                                                 juce::AudioParameterFloatAttributes().withStringFromValueFunction (rateText)
-                                                                                                       .withValueFromStringFunction (rateValue)));
+        juce::NormalisableRange<float> rateRange (low, high, 0.01f);
+        rateRange.setSkewForCentre (std::sqrt (low * high));
+        layout.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { rateId, 1 }, juce::String (name) + " Rate", rateRange, standard,
+                                                                 juce::AudioParameterFloatAttributes().withLabel ("Hz").withStringFromValueFunction (rateText)));
     }
     addPercent (ParamIDs::crackle,     "Vinyl Crackle", 0.0f);
     addPercent (ParamIDs::tube,        "Tube",        0.0f);
@@ -199,8 +180,8 @@ juce::AudioProcessorValueTreeState::ParameterLayout UlMaToProcessor::createParam
     }
 
     // Limiter
-    juce::NormalisableRange<float> releaseRange (1.0f, 1000.0f, 0.1f);
-    releaseRange.setSkewForCentre (100.0f);
+    juce::NormalisableRange<float> releaseRange (0.0f, 10000.0f, 0.01f);
+    releaseRange.setSkewForCentre (200.0f);
     layout.add (std::make_unique<juce::AudioParameterBool> (juce::ParameterID { ParamIDs::limiterOn, 1 }, "Limiter On", true));
     layout.add (std::make_unique<juce::AudioParameterBool> (juce::ParameterID { ParamIDs::limiterTruePeak, 1 }, "Limiter True Peak", true));
     layout.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { ParamIDs::limiterInput, 1 }, "Limiter Input",
@@ -211,8 +192,24 @@ juce::AudioProcessorValueTreeState::ParameterLayout UlMaToProcessor::createParam
                                                                  .withStringFromValueFunction ([] (float v, int) { return juce::String (v, 2) + " dBFS"; })));
     layout.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { ParamIDs::limiterRelease, 1 }, "Limiter Release", releaseRange, 100.0f,
                                                              juce::AudioParameterFloatAttributes().withLabel ("ms")
-                                                                 .withStringFromValueFunction ([] (float v, int) { return juce::String (v, v < 10.0f ? 1 : 0) + " ms"; })));
-    addPercent (ParamIDs::limiterLink, "Limiter Link", 100.0f);
+                                                                 .withStringFromValueFunction ([] (float v, int) { return v >= 1000.0f ? juce::String (v / 1000.0f, 2) + " s" : juce::String (v, v < 10.0f ? 1 : 0) + " ms"; })
+                                                                 .withValueFromStringFunction ([] (const juce::String& t) { return t.trim().endsWithIgnoreCase ("ms") || ! t.trim().endsWithIgnoreCase ("s") ? t.getFloatValue() : t.getFloatValue() * 1000.0f; })));
+    addPercent (ParamIDs::limiterLink, "Limiter Link Transients", 100.0f);
+    addPercent (ParamIDs::limiterLinkRelease, "Limiter Link Release", 100.0f);
+    addPercent (ParamIDs::limiterAttack, "Limiter Attack", 70.0f);
+    layout.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { ParamIDs::limiterLookahead, 1 }, "Limiter Lookahead",
+                                                             juce::NormalisableRange<float> (0.1f, 5.0f, 0.01f), 3.0f,
+                                                             juce::AudioParameterFloatAttributes().withLabel ("ms")
+                                                                 .withStringFromValueFunction ([] (float v, int) { return juce::String (v, 2) + " ms"; })));
+    layout.add (std::make_unique<juce::AudioParameterBool> (juce::ParameterID { ParamIDs::limiterAutoRelease, 1 }, "Limiter Auto Release", false));
+    layout.add (std::make_unique<juce::AudioParameterChoice> (juce::ParameterID { ParamIDs::limiterOversampling, 1 }, "Limiter Oversampling",
+                                                              juce::StringArray { "Off", "2x", "4x", "8x" }, 1));
+    layout.add (std::make_unique<juce::AudioParameterBool> (juce::ParameterID { ParamIDs::limiterDc, 1 }, "Limiter DC Filter", false));
+    layout.add (std::make_unique<juce::AudioParameterBool> (juce::ParameterID { ParamIDs::limiterUnity, 1 }, "Limiter Unity Gain", false));
+    layout.add (std::make_unique<juce::AudioParameterChoice> (juce::ParameterID { ParamIDs::limiterDither, 1 }, "Limiter Dither",
+                                                              juce::StringArray { "Off", "24 bit", "20 bit", "16 bit" }, 0));
+    layout.add (std::make_unique<juce::AudioParameterChoice> (juce::ParameterID { ParamIDs::limiterShaping, 1 }, "Limiter Noise Shaping",
+                                                              juce::StringArray { "Off", "Basic", "Optimized" }, 0));
 
     static constexpr const char* stageNames[] { "EQ Match", "Dynamics", "Analog Heat", "PhaseQ", "Graphic EQ", "Limiter" };
     for (int stage = 0; stage < MatchEngine::numStages; ++stage)
@@ -299,8 +296,8 @@ MatchEngine::StageSettings UlMaToProcessor::readStageSettings() const
     const auto depth = [] (float percent) { const float x = 0.01f * percent; return x * x; };   // 0 ... 1, square law
     s.analog.wowDepth     = depth (wowDepthParam->load());
     s.analog.flutterDepth = depth (flutterDepthParam->load());
-    s.analog.wowRate      = transportRate (true, wowRateParam->load());
-    s.analog.flutterRate  = transportRate (false, flutterRateParam->load());
+    s.analog.wowRate      = wowRateParam->load();
+    s.analog.flutterRate  = flutterRateParam->load();
     s.analog.crackle     = crackleParam->load() * 0.01f;
     s.analog.tube        = tubeParam->load() * 0.01f;
     s.analog.transformer = transformerParam->load() * 0.01f;
@@ -333,7 +330,16 @@ MatchEngine::StageSettings UlMaToProcessor::readStageSettings() const
     s.limiter.inputDb   = value (ParamIDs::limiterInput);
     s.limiter.ceilingDb = value (ParamIDs::limiterCeiling);
     s.limiter.releaseMs = value (ParamIDs::limiterRelease);
-    s.limiter.link      = value (ParamIDs::limiterLink) * 0.01f;
+    s.limiter.linkTransients = value (ParamIDs::limiterLink) * 0.01f;
+    s.limiter.linkRelease    = value (ParamIDs::limiterLinkRelease) * 0.01f;
+    s.limiter.attack         = value (ParamIDs::limiterAttack) * 0.01f;
+    s.limiter.lookaheadMs    = value (ParamIDs::limiterLookahead);
+    s.limiter.autoRelease    = value (ParamIDs::limiterAutoRelease) > 0.5f;
+    s.limiter.oversampling   = juce::roundToInt (value (ParamIDs::limiterOversampling));
+    s.limiter.dcFilter       = value (ParamIDs::limiterDc) > 0.5f;
+    s.limiter.unityGain      = value (ParamIDs::limiterUnity) > 0.5f;
+    s.limiter.ditherBits     = std::array { 0, 24, 20, 16 }[(size_t) juce::jlimit (0, 3, juce::roundToInt (value (ParamIDs::limiterDither)))];
+    s.limiter.noiseShaping   = juce::roundToInt (value (ParamIDs::limiterShaping));
     for (size_t stage = 0; stage < s.bypass.size(); ++stage)
         s.bypass[stage] = value (ParamIDs::stageBypass[stage]) > 0.5f;
     return s;

@@ -14,7 +14,7 @@ namespace ParamIDs
     // Analog heat (all 0 ... 100 %)
     inline constexpr const char* tape[] { "tape1", "tape2", "tape3", "tape4", "tape5" };
     inline constexpr const char* wowDepth     = "wowDepth";       // 0 % (off) ... 100 %
-    inline constexpr const char* wowRate      = "wowRate";        // -50 ... 0 (reference machine) ... +50, shown in Hz
+    inline constexpr const char* wowRate      = "wowRate";        // Hz
     inline constexpr const char* flutterDepth = "flutterDepth";
     inline constexpr const char* flutterRate  = "flutterRate";
     inline constexpr const char* crackle     = "crackle";
@@ -44,7 +44,16 @@ namespace ParamIDs
     inline constexpr const char* limiterInput    = "limiterInput";
     inline constexpr const char* limiterCeiling  = "limiterCeiling";
     inline constexpr const char* limiterRelease  = "limiterRelease";
-    inline constexpr const char* limiterLink     = "limiterLink";
+    inline constexpr const char* limiterLink     = "limiterLink";          // channel link of the transients
+    inline constexpr const char* limiterLinkRelease = "limiterLinkRelease";
+    inline constexpr const char* limiterLookahead = "limiterLookahead";
+    inline constexpr const char* limiterAttack   = "limiterAttack";
+    inline constexpr const char* limiterAutoRelease = "limiterAutoRelease";
+    inline constexpr const char* limiterOversampling = "limiterOversampling";
+    inline constexpr const char* limiterDc       = "limiterDc";
+    inline constexpr const char* limiterUnity    = "limiterUnity";
+    inline constexpr const char* limiterDither   = "limiterDither";
+    inline constexpr const char* limiterShaping  = "limiterShaping";
 
     // Bypass per stage (MatchEngine::Stage order)
     inline constexpr const char* stageBypass[] { "bypassEqMatch", "bypassDynamics", "bypassAnalog", "bypassPhaseQ", "bypassGraphicEq", "bypassLimiter" };
@@ -133,6 +142,9 @@ public:
     // Limiter meters
     float getLimiterReductionDb() const noexcept           { return engine.getLimiterReductionDb(); }
     float getLimiterOutputDb() const noexcept              { return engine.getLimiterOutputDb(); }
+    Limit::Meters getLimiterMeters() const noexcept        { return engine.getLimiterMeters(); }
+    int readLimiterColumns (Limit::Column* destination, int maxCount) noexcept   { return engine.readLimiterColumns (destination, maxCount); }
+    void resetLimiterLoudness() noexcept                   { engine.resetLimiterLoudness(); }
 
     // Dynamics: live input / output distributions, slopes and current gain per band
     MatchEngine::DynamicsState getDynamicsState() const    { return engine.getDynamicsState(); }

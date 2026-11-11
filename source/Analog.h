@@ -48,7 +48,7 @@ namespace Analog
             oversampling.initProcessing ((size_t) maxBlockSize);
             splitter.prepare (sampleRate * 2.0, true);
 
-            transportDelay = juce::jmax (48, juce::roundToInt (sampleRate * 0.015));   // 15 ms around which the wow moves
+            transportDelay = juce::jmax (64, juce::roundToInt (sampleRate * 0.02));   // 20 ms around which the wow moves
             latency = transportDelay + juce::roundToInt (oversampling.getLatencyInSamples());
             transport.setSize (2, juce::nextPowerOfTwo (transportDelay * 2 + 8));
             dry.setSize (2, latency + 1);
@@ -169,7 +169,7 @@ namespace Analog
             tr[transportPosition] = r;
 
             // Wow: the pitch moves at the wow rate (with its second harmonic, as from an
-            // eccentric capstan, and a slow random drift); full depth swings the pitch by 5 %
+            // eccentric capstan, and a slow random drift); full depth swings the pitch by 8 %
             // (the reference machine, ~0.05 %, is near 10 %) - the delay swing that gives this
             // is fs * deviation / (2 pi rate)
             const double twoPi = juce::MathConstants<double>::twoPi;
@@ -188,12 +188,12 @@ namespace Analog
             wowAmount     += smoothing * (s.wowDepth - wowAmount);
             flutterAmount += smoothing * (s.flutterDepth - flutterAmount);
 
-            const float swing = juce::jmin ((float) (0.05 * sampleRate / (twoPi * s.wowRate)) * wowAmount, (float) transportDelay - 3.0f);
+            const float swing = juce::jmin ((float) (0.08 * sampleRate / (twoPi * s.wowRate)) * wowAmount, (float) transportDelay - 3.0f);
             const float modulation = swing * (0.75f * (float) std::sin (wowPhase) + 0.12f * (float) std::sin (2.0 * wowPhase + 0.7) + 0.2f * drift);
 
-            // Flutter: the level moves at the flutter rate; full depth by about +-4 dB (the
-            // reference machine, ~0.1 dB, is near 15 %)
-            const float flutterGain = 1.0f + 0.5f * flutterAmount
+            // Flutter: the level moves at the flutter rate; full depth by about 17 dB peak to
+            // peak (the reference machine, ~0.1 dB, is near 12 %)
+            const float flutterGain = 1.0f + 0.75f * flutterAmount
                                     * (0.8f * (float) std::sin (flutterPhase) + 0.15f * (float) std::sin (2.0 * flutterPhase + 1.3) + 0.25f * flutterNoise);
             const float delay = (float) transportDelay + modulation;
 

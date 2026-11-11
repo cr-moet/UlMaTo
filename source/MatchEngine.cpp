@@ -260,7 +260,7 @@ void MatchEngine::prepare (double newSampleRate, int)
     graphicFilter.prepare (blockSize, firLength);
     designedPhase = {};
     designedEq = {};
-    limiter.prepare (sampleRate);
+    limiter.prepare (sampleRate, blockSize);
     for (int stage = 0; stage < numStages; ++stage)
     {
         auto& b = bypass[(size_t) stage];
