@@ -67,22 +67,30 @@ UlMaToProcessor::UlMaToProcessor()
       apvts (*this, nullptr, "UlMaTo", createParameterLayout())
 {
     formatManager.registerBasicFormats();
-    amountParam   = apvts.getRawParameterValue (ParamIDs::amount);
-    responseParam = apvts.getRawParameterValue (ParamIDs::response);
-    dynamicsParam = apvts.getRawParameterValue (ParamIDs::dynamics);
-    bypassParam   = dynamic_cast<juce::AudioParameterBool*> (apvts.getParameter (ParamIDs::bypass));
-    for (size_t b = 0; b < tapeParams.size(); ++b)
-        tapeParams[b] = apvts.getRawParameterValue (ParamIDs::tape[b]);
-    wowDepthParam     = apvts.getRawParameterValue (ParamIDs::wowDepth);
-    wowRateParam      = apvts.getRawParameterValue (ParamIDs::wowRate);
-    flutterDepthParam = apvts.getRawParameterValue (ParamIDs::flutterDepth);
-    flutterRateParam  = apvts.getRawParameterValue (ParamIDs::flutterRate);
-    crackleParam     = apvts.getRawParameterValue (ParamIDs::crackle);
-    humParam         = apvts.getRawParameterValue (ParamIDs::hum);
-    hum60Param       = apvts.getRawParameterValue (ParamIDs::hum60);
-    driveParam       = apvts.getRawParameterValue (ParamIDs::analogDrive);
-    tubeParam        = apvts.getRawParameterValue (ParamIDs::tube);
-    transformerParam = apvts.getRawParameterValue (ParamIDs::transformer);
+    bypassParam = dynamic_cast<juce::AudioParameterBool*> (apvts.getParameter (ParamIDs::bypass));
+
+    // The audio thread reads the parameters through these pointers (no search by name)
+    const auto raw = [this] (const char* id) { return apvts.getRawParameterValue (id); };
+    params.amount = raw (ParamIDs::amount);
+    params.response = raw (ParamIDs::response);
+    params.dynamics = raw (ParamIDs::dynamics);
+    for (size_t b = 0; b < params.tape.size(); ++b)
+        params.tape[b] = raw (ParamIDs::tape[b]);
+    params.analog = { raw (ParamIDs::analogDrive), raw (ParamIDs::wowDepth), raw (ParamIDs::wowRate), raw (ParamIDs::flutterDepth),
+                      raw (ParamIDs::flutterRate), raw (ParamIDs::crackle), raw (ParamIDs::hum), raw (ParamIDs::hum60),
+                      raw (ParamIDs::tube), raw (ParamIDs::transformer) };
+    for (size_t b = 0; b < params.eq.size(); ++b)
+        params.eq[b] = { raw (ParamIDs::eqOn[b]), raw (ParamIDs::eqBypass[b]), raw (ParamIDs::eqType[b]), nullptr,
+                         raw (ParamIDs::eqFreq[b]), raw (ParamIDs::eqGain[b]), raw (ParamIDs::eqQ[b]) };
+    for (size_t n = 0; n < params.phase.size(); ++n)
+        params.phase[n] = { raw (ParamIDs::phaseOn[n]), raw (ParamIDs::phaseBypass[n]), raw (ParamIDs::phaseShape[n]), raw (ParamIDs::phaseSide[n]),
+                            raw (ParamIDs::phaseFreq[n]), raw (ParamIDs::phaseAmount[n]), raw (ParamIDs::phaseQ[n]) };
+    params.limiter = { raw (ParamIDs::limiterOn), raw (ParamIDs::limiterTruePeak), raw (ParamIDs::limiterInput), raw (ParamIDs::limiterCeiling),
+                       raw (ParamIDs::limiterRelease), raw (ParamIDs::limiterAutoRelease), raw (ParamIDs::limiterLink), raw (ParamIDs::limiterLinkRelease),
+                       raw (ParamIDs::limiterAttack), raw (ParamIDs::limiterLookahead), raw (ParamIDs::limiterOversampling), raw (ParamIDs::limiterDc),
+                       raw (ParamIDs::limiterUnity), raw (ParamIDs::limiterDither), raw (ParamIDs::limiterShaping) };
+    for (size_t stage = 0; stage < params.stageBypass.size(); ++stage)
+        params.stageBypass[stage] = raw (ParamIDs::stageBypass[stage]);
 }
 
 UlMaToProcessor::~UlMaToProcessor()
@@ -280,9 +288,9 @@ void UlMaToProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Midi
         }
 
         juce::AudioBuffer<float> chunk (buffer.getArrayOfWritePointers(), buffer.getNumChannels(), start, count);
-        engine.process (chunk, amountParam->load() * 0.01f, responseParam->load(), dynamicsParam->load() * 0.01f, stages);
+        engine.process (chunk, params.amount->load() * 0.01f, params.response->load(), params.dynamics->load() * 0.01f, stages);
 
-        if (! bypassMix.isSmoothing() && bypassMix.getCurrentValue() == 0.0f)
+        if (! bypassMix.isSmoothing() && juce::exactlyEqual (bypassMix.getCurrentValue(), 0.0f))
             continue;
 
         for (int i = 0; i < count; ++i)
@@ -300,60 +308,58 @@ void UlMaToProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Midi
 MatchEngine::StageSettings UlMaToProcessor::readStageSettings() const
 {
     MatchEngine::StageSettings s;
-    for (size_t b = 0; b < tapeParams.size(); ++b)
-        s.analog.tape[b] = tapeParams[b]->load() * 0.01f;
+    const auto on = [] (const std::atomic<float>* p) { return p->load() > 0.5f; };
+    const auto index = [] (const std::atomic<float>* p) { return juce::roundToInt (p->load()); };
     const auto depth = [] (float percent) { const float x = 0.01f * percent; return x * x; };   // 0 ... 1, square law
-    s.analog.wowDepth     = depth (wowDepthParam->load());
-    s.analog.flutterDepth = depth (flutterDepthParam->load());
-    s.analog.wowRate      = wowRateParam->load();
-    s.analog.flutterRate  = flutterRateParam->load();
-    s.analog.crackle     = crackleParam->load() * 0.01f;
-    s.analog.hum         = humParam->load() * 0.01f;
-    s.analog.hum60       = hum60Param->load() > 0.5f;
-    s.analog.driveDb     = driveParam->load();
-    s.analog.tube        = tubeParam->load() * 0.01f;
-    s.analog.transformer = transformerParam->load() * 0.01f;
 
-    const auto value = [this] (const char* id) { return apvts.getRawParameterValue (id)->load(); };
-    for (size_t b = 0; b < (size_t) Tone::numBands; ++b)
+    const auto& a = params.analog;
+    for (size_t b = 0; b < params.tape.size(); ++b)
+        s.analog.tape[b] = params.tape[b]->load() * 0.01f;
+    s.analog.driveDb      = a.drive->load();
+    s.analog.wowDepth     = depth (a.wowDepth->load());
+    s.analog.wowRate      = a.wowRate->load();
+    s.analog.flutterDepth = depth (a.flutterDepth->load());
+    s.analog.flutterRate  = a.flutterRate->load();
+    s.analog.crackle      = a.crackle->load() * 0.01f;
+    s.analog.hum          = a.hum->load() * 0.01f;
+    s.analog.hum60        = on (a.hum60);
+    s.analog.tube         = a.tube->load() * 0.01f;
+    s.analog.transformer  = a.transformer->load() * 0.01f;
+
+    for (size_t b = 0; b < params.eq.size(); ++b)
     {
-        auto& band = s.eq.band[b];
-        band.on    = value (ParamIDs::eqOn[b]) > 0.5f && value (ParamIDs::eqBypass[b]) < 0.5f;
-        band.type  = (Tone::EqType) juce::roundToInt (value (ParamIDs::eqType[b]));
-        band.freq  = value (ParamIDs::eqFreq[b]);
-        band.gain  = value (ParamIDs::eqGain[b]);
-        band.q     = value (ParamIDs::eqQ[b]);
+        const auto& p = params.eq[b];
+        s.eq.band[b] = { on (p.on) && ! on (p.bypass), (Tone::EqType) index (p.shape), p.freq->load(), p.value->load(), p.q->load() };
     }
     s.eq.valid = true;
-    for (size_t n = 0; n < (size_t) Tone::numPhaseNodes; ++n)
+
+    for (size_t n = 0; n < params.phase.size(); ++n)
     {
-        auto& node   = s.phase.node[n];
-        node.on      = value (ParamIDs::phaseOn[n]) > 0.5f && value (ParamIDs::phaseBypass[n]) < 0.5f;
-        node.channel = value (ParamIDs::phaseSide[n]) > 0.5f ? 1 : 0;
-        node.shape   = (Tone::PhaseShape) juce::roundToInt (value (ParamIDs::phaseShape[n]));
-        node.freq    = value (ParamIDs::phaseFreq[n]);
-        node.amount  = value (ParamIDs::phaseAmount[n]);
-        node.q       = value (ParamIDs::phaseQ[n]);
+        const auto& p = params.phase[n];
+        s.phase.node[n] = { on (p.on) && ! on (p.bypass), on (p.side) ? 1 : 0, (Tone::PhaseShape) index (p.shape),
+                            p.freq->load(), p.value->load(), p.q->load() };
     }
     s.phase.valid = true;
 
-    s.limiter.on        = value (ParamIDs::limiterOn) > 0.5f;
-    s.limiter.truePeak  = value (ParamIDs::limiterTruePeak) > 0.5f;
-    s.limiter.inputDb   = value (ParamIDs::limiterInput);
-    s.limiter.ceilingDb = value (ParamIDs::limiterCeiling);
-    s.limiter.releaseMs = value (ParamIDs::limiterRelease);
-    s.limiter.linkTransients = value (ParamIDs::limiterLink) * 0.01f;
-    s.limiter.linkRelease    = value (ParamIDs::limiterLinkRelease) * 0.01f;
-    s.limiter.attack         = value (ParamIDs::limiterAttack) * 0.01f;
-    s.limiter.lookaheadMs    = value (ParamIDs::limiterLookahead);
-    s.limiter.autoRelease    = value (ParamIDs::limiterAutoRelease) > 0.5f;
-    s.limiter.oversampling   = juce::roundToInt (value (ParamIDs::limiterOversampling));
-    s.limiter.dcFilter       = value (ParamIDs::limiterDc) > 0.5f;
-    s.limiter.unityGain      = value (ParamIDs::limiterUnity) > 0.5f;
-    s.limiter.ditherBits     = std::array { 0, 24, 20, 16 }[(size_t) juce::jlimit (0, 3, juce::roundToInt (value (ParamIDs::limiterDither)))];
-    s.limiter.noiseShaping   = juce::roundToInt (value (ParamIDs::limiterShaping));
+    const auto& l = params.limiter;
+    s.limiter.on             = on (l.on);
+    s.limiter.truePeak       = on (l.truePeak);
+    s.limiter.inputDb        = l.input->load();
+    s.limiter.ceilingDb      = l.ceiling->load();
+    s.limiter.releaseMs      = l.release->load();
+    s.limiter.autoRelease    = on (l.autoRelease);
+    s.limiter.linkTransients = l.linkTransients->load() * 0.01f;
+    s.limiter.linkRelease    = l.linkRelease->load() * 0.01f;
+    s.limiter.attack         = l.attack->load() * 0.01f;
+    s.limiter.lookaheadMs    = l.lookahead->load();
+    s.limiter.oversampling   = index (l.oversampling);
+    s.limiter.dcFilter       = on (l.dc);
+    s.limiter.unityGain      = on (l.unity);
+    s.limiter.ditherBits     = std::array { 0, 24, 20, 16 }[(size_t) juce::jlimit (0, 3, index (l.dither))];
+    s.limiter.noiseShaping   = index (l.shaping);
+
     for (size_t stage = 0; stage < s.bypass.size(); ++stage)
-        s.bypass[stage] = value (ParamIDs::stageBypass[stage]) > 0.5f;
+        s.bypass[stage] = on (params.stageBypass[stage]);
     return s;
 }
 

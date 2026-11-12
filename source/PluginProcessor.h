@@ -144,7 +144,6 @@ public:
 
     // Limiter meters
     float getLimiterReductionDb() const noexcept           { return engine.getLimiterReductionDb(); }
-    float getLimiterOutputDb() const noexcept              { return engine.getLimiterOutputDb(); }
     Limit::Meters getLimiterMeters() const noexcept        { return engine.getLimiterMeters(); }
     float getAnalogVuDb (int channel) const noexcept        { return engine.getAnalogVuDb (channel); }
     int readLimiterColumns (Limit::Column* destination, int maxCount) noexcept   { return engine.readLimiterColumns (destination, maxCount); }
@@ -162,21 +161,24 @@ private:
 
     juce::AudioFormatManager formatManager;
     MatchEngine engine;
-    std::atomic<float>* amountParam = nullptr;
-    std::atomic<float>* responseParam = nullptr;
-    std::atomic<float>* dynamicsParam = nullptr;
     juce::AudioParameterBool* bypassParam = nullptr;
-    std::array<std::atomic<float>*, Dynamics::numBands> tapeParams {};
-    std::atomic<float>* wowDepthParam = nullptr;
-    std::atomic<float>* wowRateParam = nullptr;
-    std::atomic<float>* flutterDepthParam = nullptr;
-    std::atomic<float>* flutterRateParam = nullptr;
-    std::atomic<float>* crackleParam = nullptr;
-    std::atomic<float>* humParam = nullptr;
-    std::atomic<float>* hum60Param = nullptr;
-    std::atomic<float>* driveParam = nullptr;
-    std::atomic<float>* tubeParam = nullptr;
-    std::atomic<float>* transformerParam = nullptr;
+
+    // Raw values of the parameters, looked up once
+    using Raw = std::atomic<float>*;
+    struct NodeParams    { Raw on, bypass, shape, side, freq, value, q; };   // side: PhaseQ only
+    struct AnalogParams  { Raw drive, wowDepth, wowRate, flutterDepth, flutterRate, crackle, hum, hum60, tube, transformer; };
+    struct LimiterParams { Raw on, truePeak, input, ceiling, release, autoRelease, linkTransients, linkRelease, attack, lookahead,
+                           oversampling, dc, unity, dither, shaping; };
+    struct
+    {
+        Raw amount = nullptr, response = nullptr, dynamics = nullptr;
+        std::array<Raw, Dynamics::numBands> tape {};
+        AnalogParams analog {};
+        std::array<NodeParams, Tone::numBands> eq {};
+        std::array<NodeParams, Tone::numPhaseNodes> phase {};
+        LimiterParams limiter {};
+        std::array<Raw, MatchEngine::numStages> stageBypass {};
+    } params;
 
     // Settings of the other stages, read from the parameters for every block
     MatchEngine::StageSettings readStageSettings() const;

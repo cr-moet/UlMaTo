@@ -24,9 +24,11 @@ public:
     void paint (juce::Graphics&) override;
     void resized() override;
 
+    // Shows the page of a stage (MatchEngine::Stage)
+    void showPage (int page);
+
 private:
     void timerCallback() override;
-    void showPage (int page);
     StageTabs::Bypassed bypassedStages() const;
 
     UlMaToProcessor& processorRef;

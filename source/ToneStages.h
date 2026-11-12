@@ -155,7 +155,9 @@ namespace Tone
     public:
         struct Response { std::complex<float> a { 1.0f }, b {}, c {}, d { 1.0f }; };
 
-        void prepare (int newBlockSize, int newLength)
+        enum class Window { tukey, blackman };
+
+        void prepare (int newBlockSize, int newLength, Window shape = Window::tukey)
         {
             blockSize = newBlockSize;
             length = newLength;
@@ -165,14 +167,20 @@ namespace Tone
                 d.assign ((size_t) length * 2, 0.0f);
             ir.assign ((size_t) length, 0.0f);
 
-            // Tukey window: flat in the middle, so phase filters keep their shape
+            // Tukey: flat in the middle, so phase filters keep their shape; Blackman: the
+            // smoothest magnitude (EQ match)
             window.resize ((size_t) length);
-            const int taper = length / 8;
-            for (int i = 0; i < length; ++i)
+            if (shape == Window::blackman)
+                juce::dsp::WindowingFunction<float>::fillWindowingTables (window.data(), (size_t) length, juce::dsp::WindowingFunction<float>::blackman, false);
+            else
             {
-                const int edge = juce::jmin (i, length - 1 - i);
-                window[(size_t) i] = edge >= taper ? 1.0f
-                                                   : 0.5f * (1.0f - std::cos (juce::MathConstants<float>::pi * (float) edge / (float) taper));
+                const int taper = length / 8;
+                for (int i = 0; i < length; ++i)
+                {
+                    const int edge = juce::jmin (i, length - 1 - i);
+                    window[(size_t) i] = edge >= taper ? 1.0f
+                                                       : 0.5f * (1.0f - std::cos (juce::MathConstants<float>::pi * (float) edge / (float) taper));
+                }
             }
 
             convolver.prepare (blockSize, length);
@@ -217,11 +225,15 @@ namespace Tone
             for (auto& d : data)
                 std::fill (d.begin(), d.end(), 0.0f);
 
+            bool identity = true, diagonal = true;
             for (int k = 0; k <= n / 2; ++k)
             {
                 Response r = response ((float) ((double) k * sampleRate / n));
                 if (k == 0 || k == n / 2)   // DC and Nyquist must stay real
                     r = { r.a.real(), r.b.real(), r.c.real(), r.d.real() };
+                const auto is = [] (std::complex<float> z, float re) { return juce::exactlyEqual (z.real(), re) && juce::exactlyEqual (z.imag(), 0.0f); };
+                diagonal = diagonal && is (r.b, 0.0f) && is (r.c, 0.0f);
+                identity = identity && diagonal && is (r.a, 1.0f) && is (r.d, 1.0f);
                 const std::complex<float> values[] { r.a, r.b, r.c, r.d };
                 for (size_t i = 0; i < 4; ++i)
                 {
@@ -238,6 +250,9 @@ namespace Tone
                     ir[(size_t) j] = data[i][(size_t) ((j + n / 2) % n)] * window[(size_t) j];
                 MatrixConvolver::makeSpectra (ir.data(), n, blockSize, *partitionFft, scratch, *targets[i]);
             }
+            f.identity = identity;   // the windowed impulse is exactly a delay of n / 2
+            f.diagonal = diagonal;
+            f.delay = n / 2;
         }
 
         int blockSize = 512, length = 4096;

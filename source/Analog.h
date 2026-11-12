@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Dynamics.h"
+#include <complex>
 
 //==============================================================================
 // Analog heat: the colour of analog gear, in this order
@@ -225,12 +226,13 @@ namespace Analog
             flutterAmount += smoothing * (s.flutterDepth - flutterAmount);
 
             const float swing = juce::jmin ((float) (0.08 * sampleRate / (twoPi * s.wowRate)) * wowAmount, (float) transportDelay - 3.0f);
-            const float modulation = swing * (0.75f * (float) std::sin (wowPhase) + 0.12f * (float) std::sin (2.0 * wowPhase + 0.7) + 0.2f * drift);
+            const float wow = (float) wowPhase, flutter = (float) flutterPhase;
+            const float modulation = swing * (0.75f * std::sin (wow) + 0.12f * std::sin (2.0f * wow + 0.7f) + 0.2f * drift);
 
             // Flutter: the level moves at the flutter rate; full depth by about 17 dB peak to
             // peak (the reference machine, ~0.1 dB, is near 12 %)
             const float flutterGain = 1.0f + 0.75f * flutterAmount
-                                    * (0.8f * (float) std::sin (flutterPhase) + 0.15f * (float) std::sin (2.0 * flutterPhase + 1.3) + 0.25f * flutterNoise);
+                                    * (0.8f * std::sin (flutter) + 0.15f * std::sin (2.0f * flutter + 1.3f) + 0.25f * flutterNoise);
             const float delay = (float) transportDelay + modulation;
 
             // Cubic (Hermite) interpolation
@@ -278,10 +280,20 @@ namespace Analog
             {
                 humPhase = std::fmod (humPhase + juce::MathConstants<double>::twoPi * (s.hum60 ? 60.0 : 50.0) / sampleRate, juce::MathConstants<double>::twoPi);
                 humWander += (random() - humWander) * (float) (0.5 / sampleRate);
+                // harmonic k: sin ((k + 1) phase + 0.4 k) - the powers of e^(i phase) give all of them
                 static constexpr float harmonics[] { 1.0f, 0.45f, 0.3f, 0.12f, 0.08f, 0.05f, 0.03f };
+                static const auto offsets = []
+                {
+                    std::array<std::complex<float>, 7> o;
+                    for (size_t k = 0; k < o.size(); ++k)
+                        o[k] = std::polar (1.0f, 0.4f * (float) k);
+                    return o;
+                }();
+                const std::complex<float> step = std::polar (1.0f, (float) humPhase);
+                std::complex<float> power = step;
                 float h = 0.0f;
-                for (int k = 0; k < 7; ++k)
-                    h += harmonics[k] * (float) std::sin ((k + 1) * humPhase + 0.4 * k);
+                for (size_t k = 0; k < 7; ++k, power *= step)
+                    h += harmonics[k] * (power * offsets[k]).imag();
                 h *= 0.0316f * humAmount * humAmount * (1.0f + 0.15f * humWander) * drive;
                 l += h;
                 r += h;
@@ -323,8 +335,7 @@ namespace Analog
 
             // Warm tape curve: asymmetric (a little bias), unity gain for small signals
             constexpr float bias = 0.15f;
-            const float tapeNorm = 1.0f / (1.0f - std::tanh (bias) * std::tanh (bias));
-            const auto tape = [&] (float x, float drive) { return (std::tanh (drive * x + bias) - std::tanh (bias)) * tapeNorm / drive; };
+            const float tanhBias = std::tanh (bias), tapeNorm = 1.0f / (1.0f - tanhBias * tanhBias);
 
             // Tube: softer on the negative side -> even harmonics
             const auto tube = [] (float x, float drive)
@@ -342,15 +353,23 @@ namespace Analog
 
                 if (tapeOn)
                 {
+                    // All band curves in one plain loop, so the compiler can vectorise the tanh
                     splitter.process (x[0], x[1], bl, br);
-                    Dynamics::Values* bands[] { &bl, &br };
+                    const Dynamics::Values* bands[] { &bl, &br };
+                    constexpr size_t nb = (size_t) Dynamics::numBands;
+                    std::array<float, 2 * nb> drive {}, curve {};
+                    for (size_t c = 0; c < 2; ++c)
+                        for (size_t b = 0; b < nb; ++b)
+                            if (s.tape[b] > 0.0f)
+                                drive[c * nb + b] = tapeDrive[b] * (1.0f + tapeSpread[b] * random());
+                    for (size_t k = 0; k < curve.size(); ++k)
+                        curve[k] = std::tanh (drive[k] * (*bands[k / nb])[k % nb] + bias);
                     for (size_t c = 0; c < 2; ++c)
                         for (size_t b = 0; b < (size_t) Dynamics::numBands; ++b)
                             if (s.tape[b] > 0.0f)
                             {
-                                const float band = (*bands[c])[b];
-                                x[c] += tapeHarmonics[c][b] (band, tape (band, tapeDrive[b] * (1.0f + tapeSpread[b] * random())),
-                                                            bandCoefficient[b]);
+                                const size_t k = c * nb + b;
+                                x[c] += tapeHarmonics[c][b] ((*bands[c])[b], (curve[k] - tanhBias) * tapeNorm / drive[k], bandCoefficient[b]);
                             }
                 }
 

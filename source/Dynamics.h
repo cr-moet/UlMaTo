@@ -106,31 +106,71 @@ namespace Dynamics
     // Five bands from Linkwitz-Riley crossovers (4th order). With 'compensate' the lower
     // bands also pass the allpasses of the higher crossovers, so all bands are in phase
     // and add up to a flat response.
+    // Linkwitz-Riley crossover, 4th order, for both channels - the same maths as
+    // juce::dsp::LinkwitzRileyFilter (two TPT state variable stages), inlined
+    struct Crossover
+    {
+        void prepare (double sampleRate, float frequency)
+        {
+            g = (float) std::tan (juce::MathConstants<double>::pi * frequency / sampleRate);
+            h = (float) (1.0 / (1.0 + R2 * g + g * g));
+            reset();
+        }
+
+        void reset() noexcept   { state = {}; }
+
+        void split (size_t channel, float x, float& low, float& high) noexcept
+        {
+            auto& s = state[channel];
+            const float yH = (x - (R2 + g) * s[0] - s[1]) * h;
+            const float yB = g * yH + s[0];
+            s[0] = g * yH + yB;
+            const float yL = g * yB + s[1];
+            s[1] = g * yB + yL;
+
+            const float yH2 = (yL - (R2 + g) * s[2] - s[3]) * h;
+            const float yB2 = g * yH2 + s[2];
+            s[2] = g * yH2 + yB2;
+            const float yL2 = g * yB2 + s[3];
+            s[3] = g * yB2 + yL2;
+
+            low  = yL2;
+            high = yL - R2 * yB + yH - yL2;
+        }
+
+        float allpass (size_t channel, float x) noexcept
+        {
+            auto& s = state[channel];
+            const float yH = (x - (R2 + g) * s[0] - s[1]) * h;
+            const float yB = g * yH + s[0];
+            s[0] = g * yH + yB;
+            const float yL = g * yB + s[1];
+            s[1] = g * yB + yL;
+            return yL - R2 * yB + yH;
+        }
+
+        static constexpr float R2 = 1.41421356237f;   // sqrt (2)
+        float g = 0.0f, h = 1.0f;
+        std::array<std::array<float, 4>, 2> state {};
+    };
+
     class Splitter
     {
     public:
         void prepare (double sampleRate, bool shouldCompensate)
         {
             compensate = shouldCompensate;
-            const juce::dsp::ProcessSpec spec { sampleRate, 1, 2 };
-            for (int i = 0; i < numBands - 1; ++i)
-            {
-                split[(size_t) i].setCutoffFrequency (crossovers[i]);
-                split[(size_t) i].prepare (spec);
-            }
+            for (size_t i = 0; i < (size_t) numBands - 1; ++i)
+                split[i].prepare (sampleRate, crossovers[i]);
 
             // Band b gets the allpasses of crossovers b+1 ... (band 0: 3, band 1: 2, band 2: 1)
             size_t n = 0;
             for (int b = 0; b < numBands - 2; ++b)
                 for (int c = b + 1; c < numBands - 1; ++c, ++n)
-                {
-                    allpass[n].setType (juce::dsp::LinkwitzRileyFilterType::allpass);
-                    allpass[n].setCutoffFrequency (crossovers[c]);
-                    allpass[n].prepare (spec);
-                }
+                    allpass[n].prepare (sampleRate, crossovers[c]);
         }
 
-        void reset()
+        void reset() noexcept
         {
             for (auto& f : split)   f.reset();
             for (auto& f : allpass) f.reset();
@@ -141,11 +181,8 @@ namespace Dynamics
             float restL = l, restR = r;
             for (size_t c = 0; c < (size_t) numBands - 1; ++c)
             {
-                float highL, highR;
-                split[c].processSample (0, restL, bandL[c], highL);
-                split[c].processSample (1, restR, bandR[c], highR);
-                restL = highL;
-                restR = highR;
+                split[c].split (0, restL, bandL[c], restL);
+                split[c].split (1, restR, bandR[c], restR);
             }
             bandL[(size_t) numBands - 1] = restL;
             bandR[(size_t) numBands - 1] = restR;
@@ -156,15 +193,15 @@ namespace Dynamics
                 for (size_t b = 0; b < (size_t) numBands - 2; ++b)
                     for (size_t c = b + 1; c < (size_t) numBands - 1; ++c, ++n)
                     {
-                        bandL[b] = allpass[n].processSample (0, bandL[b]);
-                        bandR[b] = allpass[n].processSample (1, bandR[b]);
+                        bandL[b] = allpass[n].allpass (0, bandL[b]);
+                        bandR[b] = allpass[n].allpass (1, bandR[b]);
                     }
             }
         }
 
     private:
-        std::array<juce::dsp::LinkwitzRileyFilter<float>, numBands - 1> split;
-        std::array<juce::dsp::LinkwitzRileyFilter<float>, 6> allpass;
+        std::array<Crossover, numBands - 1> split;
+        std::array<Crossover, 6> allpass;
         bool compensate = false;
     };
 

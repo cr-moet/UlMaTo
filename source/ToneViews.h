@@ -3,9 +3,10 @@
 #include "Views.h"
 
 //==============================================================================
-// Editors for PhaseQ and the graphic EQ: six nodes over log frequency. Drag a node:
-// frequency (x) and value (y); mouse wheel: Q; double-click: back to 0. The selected node
-// is reported (onSelect), so controls next to the graph can edit it.
+// Graph of nodes over log frequency (base of PhaseQ and the graphic EQ). Drag a node:
+// frequency (x) and value (y); mouse wheel: Q. The selected node is reported (onSelect).
+// The curves are calculated only when a value they depend on has changed (collectState)
+// and kept as ready-to-fill paths; the graph repaints only then (or always, if 'animated').
 //==============================================================================
 class NodeEditor : public juce::Component,
                    private juce::Timer
@@ -42,11 +43,12 @@ public:
 
         drawBackground (g);
 
-        // The individual nodes faintly, the sum strongly
-        for (int n = 0; n < numNodes(); ++n)
-            if (isActive (n))
-                drawCurve (g, [this, n] (float f) { return nodeCurve (n, f); }, Colours::text.withAlpha (0.2f), 1.0f);
-        drawTotals (g);
+        refreshCurves();
+        for (const auto& curve : curves)
+        {
+            g.setColour (curve.colour);
+            g.fillPath (curve.path);
+        }
 
         for (int n = 0; n < numNodes(); ++n)   // the selected one last, on top
             if (n != selected && isActive (n))
@@ -80,7 +82,6 @@ public:
     void mouseExit (const juce::MouseEvent&) override   { hovered = -1; repaint(); }
 
     std::function<void (int)> onSelect;
-    int getSelected() const noexcept   { return selected; }
 
     void mouseDown (const juce::MouseEvent& e) override
     {
@@ -125,13 +126,6 @@ public:
         cycleOnClick = false;
     }
 
-    void mouseDoubleClick (const juce::MouseEvent& e) override
-    {
-        const int n = nodeAt (e.position);
-        if (n >= 0)
-            setWithGesture (valueId (n), 0.0f);
-    }
-
     void mouseWheelMove (const juce::MouseEvent& e, const juce::MouseWheelDetails& wheel) override
     {
         const int n = nodeAt (e.position) >= 0 ? nodeAt (e.position) : selected;
@@ -143,34 +137,25 @@ public:
     }
 
 protected:
-    virtual int numNodes() const   { return Tone::numBands; }
-    virtual bool isActive (int) const   { return true; }
-    virtual void drawTotals (juce::Graphics& g)   { drawCurve (g, [this] (float f) { return totalCurve (f); }, curveColour, 2.4f); }
-
-    virtual void drawNode (juce::Graphics& g, int n, juce::Point<float> c, bool on)
-    {
-        const auto r = juce::Rectangle<float> (16.0f, 16.0f).withCentre (c);
-        g.setColour (on ? curveColour : Colours::panel);
-        g.fillEllipse (r);
-        g.setColour (on ? Colours::background : Colours::text);
-        g.setFont (juce::Font (juce::FontOptions (10.0f, juce::Font::bold)));
-        g.drawText (juce::String (n + 1), r, juce::Justification::centred);
-        g.setColour (Colours::text);
-        g.drawEllipse (r, 1.2f);
-    }
-
+    virtual int numNodes() const = 0;
+    virtual bool isActive (int n) const = 0;
     virtual const char* freqId (int n) const = 0;
     virtual const char* valueId (int n) const = 0;
     virtual const char* widthId (int n) const = 0;
-    virtual float nodeCurve (int n, float f) const = 0;    // curve of one node (display units)
-    virtual float totalCurve (float f) const = 0;
     virtual juce::String describe (int n) const = 0;
+    virtual void drawNode (juce::Graphics& g, int n, juce::Point<float> centre, bool on) = 0;
     virtual void drawBackground (juce::Graphics&) {}
+
+    // The values the curves depend on, and the curves themselves (faint ones per node,
+    // the total strongly) - added with addCurve
+    virtual void collectState (std::vector<float>& values) const = 0;
+    virtual void buildCurves() = 0;
 
     float value (const char* id) const   { return processor.apvts.getRawParameterValue (id)->load(); }
 
+    // One curve (value over frequency) as a stroke, kept until the state changes
     template <typename Fn>
-    void drawCurve (juce::Graphics& g, Fn curve, juce::Colour colour, float thickness, bool dashed = false) const
+    void addCurve (Fn curve, juce::Colour colour, float thickness, bool dashed = false)
     {
         juce::Path path;
         bool first = true;
@@ -181,17 +166,18 @@ protected:
             if (first) path.startNewSubPath (pt); else path.lineTo (pt);
             first = false;
         }
-        g.setColour (colour);
+        Curve c { {}, colour };
         if (dashed)
         {
             const float dashes[] { 7.0f, 5.0f };
-            juce::Path d;
-            juce::PathStrokeType (thickness).createDashedStroke (d, path, dashes, 2);
-            g.fillPath (d);
+            juce::PathStrokeType (thickness).createDashedStroke (c.path, path, dashes, 2);
         }
         else
-            g.strokePath (path, juce::PathStrokeType (thickness, juce::PathStrokeType::curved));
+            juce::PathStrokeType (thickness, juce::PathStrokeType::curved).createStrokedPath (c.path, path);
+        curves.push_back (std::move (c));
     }
+
+    bool animated = false;   // repaint with every tick (e.g. for a spectrum behind the curves)
 
 
 
@@ -199,7 +185,7 @@ protected:
     float yOf (float v) const   { return plot.getY() + plot.getHeight() * juce::jlimit (0.0f, 1.0f, (top - v) / (top - bottom)); }
 
     UlMaToProcessor& processor;
-    juce::String title, hint { "drag a node  -  wheel: Q  -  double-click: reset" };
+    juce::String title, hint;
     juce::Colour curveColour = Colours::accent;
     juce::Rectangle<float> plot;
     float bottom, top, step;
@@ -270,10 +256,28 @@ protected:
 
     void timerCallback() override
     {
-        if (isShowing())
+        if (isShowing() && (refreshCurves() || animated))
             repaint();
     }
 
+    // Rebuilds the curves when their state (or the size) has changed; true if it did
+    bool refreshCurves()
+    {
+        scratch.clear();
+        collectState (scratch);
+        scratch.push_back (plot.getWidth());
+        scratch.push_back (plot.getHeight());
+        if (scratch == state && ! curves.empty())
+            return false;
+        state.swap (scratch);
+        curves.clear();
+        buildCurves();
+        return true;
+    }
+
+    struct Curve { juce::Path path; juce::Colour colour; };
+    std::vector<Curve> curves;
+    std::vector<float> state, scratch;
     int selected = 0, hovered = -1, dragNode = -1;
     bool cycleOnClick = false;
 };
@@ -508,6 +512,14 @@ protected:
     const char* widthId (int n) const override  { return set.q[n]; }
 
     bool isBypassed (int n) const    { return value (set.bypass[n]) > 0.5f; }
+
+    void collectState (std::vector<float>& values) const override
+    {
+        for (int n = 0; n < set.count; ++n)
+            for (auto* ids : { set.on, set.bypass, set.shape, set.side, set.freq, set.value, set.q })
+                if (ids != nullptr)
+                    values.push_back (value (ids[n]));
+    }
     int shapeIndex (int n) const     { return juce::roundToInt (value (set.shape[n])); }
     juce::String nameOf (int n) const   { return nodeName (processor.apvts, set, n); }
 
@@ -621,6 +633,7 @@ public:
         : NodeListView (p, "GRAPHIC EQ  [dB]  (linear phase: only the level changes)", -18.0f, 18.0f, 6.0f, eqNodeSet)
     {
         hint = "double-click: new band / remove band  -  drag a band  -  wheel: Q";
+        animated = true;   // the spectrum behind the curves moves all the time
     }
 
 protected:
@@ -630,18 +643,21 @@ protected:
                  value (ParamIDs::eqFreq[n]), value (ParamIDs::eqGain[n]), value (ParamIDs::eqQ[n]) };
     }
 
-    float nodeCurve (int n, float f) const override
+    // Each band faintly, the sum (without the bypassed bands) in the curve colour
+    void buildCurves() override
     {
-        const auto b = band (n, true);
-        return juce::Decibels::gainToDecibels (Tone::bandMagnitude (b.type, b.freq, b.gain, b.q, f));
-    }
-
-    float totalCurve (float f) const override
-    {
-        Tone::EqSettings s;
+        Tone::EqSettings total;
         for (int n = 0; n < Tone::numBands; ++n)
-            s.band[(size_t) n] = band (n, false);
-        return juce::Decibels::gainToDecibels (Tone::eqMagnitude (s, f));
+        {
+            total.band[(size_t) n] = band (n, false);
+            if (isActive (n))
+            {
+                const auto b = band (n, true);
+                addCurve ([&b] (float f) { return juce::Decibels::gainToDecibels (Tone::bandMagnitude (b.type, b.freq, b.gain, b.q, f)); },
+                          Colours::text.withAlpha (0.2f), 1.0f);
+            }
+        }
+        addCurve ([&total] (float f) { return juce::Decibels::gainToDecibels (Tone::eqMagnitude (total, f)); }, curveColour, 2.4f);
     }
 
     void drawNode (juce::Graphics& g, int n, juce::Point<float> c, bool on) override   { drawMarker (g, n, c, on, false); }
@@ -696,14 +712,16 @@ protected:
         return s;
     }
 
-    float nodeCurve (int n, float f) const override   { return juce::radiansToDegrees (Tone::phaseAt (settings (true), channelOf (n), f, n)); }
-    float totalCurve (float f) const override         { return juce::radiansToDegrees (Tone::phaseAt (settings(), 0, f)); }
-
-    void drawTotals (juce::Graphics& g) override
+    // Each node faintly, then right (dashed) and left (solid)
+    void buildCurves() override
     {
-        const auto s = settings();
-        drawCurve (g, [&s] (float f) { return juce::radiansToDegrees (Tone::phaseAt (s, 0, f)); }, curveColour, 2.4f);
-        drawCurve (g, [&s] (float f) { return juce::radiansToDegrees (Tone::phaseAt (s, 1, f)); }, curveColour.darker (0.35f), 2.2f, true);
+        const auto all = settings (true), active = settings();
+        for (int n = 0; n < Tone::numPhaseNodes; ++n)
+            if (isActive (n))
+                addCurve ([&all, n, c = channelOf (n)] (float f) { return juce::radiansToDegrees (Tone::phaseAt (all, c, f, n)); },
+                          Colours::text.withAlpha (0.2f), 1.0f);
+        addCurve ([&active] (float f) { return juce::radiansToDegrees (Tone::phaseAt (active, 1, f)); }, curveColour.darker (0.35f), 2.2f, true);
+        addCurve ([&active] (float f) { return juce::radiansToDegrees (Tone::phaseAt (active, 0, f)); }, curveColour, 2.4f);
     }
 
     void drawNode (juce::Graphics& g, int n, juce::Point<float> c, bool on) override   { drawMarker (g, n, c, on, channelOf (n) == 1); }
@@ -768,7 +786,7 @@ private:
         g.setFont (juce::Font (juce::FontOptions (10.0f)));
         for (float db = 0.0f; db >= -range; db -= 3.0f)
         {
-            g.setColour (db == 0.0f ? Colours::text.withAlpha (0.35f) : Colours::grid);
+            g.setColour (juce::exactlyEqual (db, 0.0f) ? Colours::text.withAlpha (0.35f) : Colours::grid);
             g.drawHorizontalLine ((int) yOf (db), plot.getX(), plot.getRight());
             g.setColour (Colours::text.withAlpha (0.6f));
             g.drawText (juce::String (db, 0), juce::Rectangle<float> (plot.getX() - 36.0f, yOf (db) - 6.0f, 32.0f, 12.0f), juce::Justification::centredRight);
@@ -906,7 +924,8 @@ private:
     void timerCallback() override
     {
         std::array<Limit::Column, 256> fresh;
-        for (int n; (n = processor.readLimiterColumns (fresh.data(), (int) fresh.size())) > 0;)
+        bool changed = false;
+        for (int n; (n = processor.readLimiterColumns (fresh.data(), (int) fresh.size())) > 0; changed = true)
             for (int i = 0; i < n; ++i)
             {
                 history[(size_t) written] = fresh[(size_t) i];
@@ -915,6 +934,8 @@ private:
 
         // Meters: fast up, slower down; peak marks fall 10 dB/s after 1 s
         const auto m = processor.getLimiterMeters();
+        const auto before = std::array { shown.truePeakL, shown.truePeakR, shown.rmsL, shown.rmsR, shown.reduction, peakHold[0], peakHold[1],
+                                         shown.momentary, shown.shortTerm, shown.integrated, shown.range, shown.truePeak };
         const auto follow = [] (float& v, float target) { v += (target > v ? 0.6f : 0.12f) * (target - v); };
         follow (shown.truePeakL, m.truePeakL); follow (shown.truePeakR, m.truePeakR);
         follow (shown.rmsL, m.rmsL);           follow (shown.rmsR, m.rmsR);
@@ -931,7 +952,13 @@ private:
         }
         shown.momentary = m.momentary; shown.shortTerm = m.shortTerm; shown.integrated = m.integrated;
         shown.range = m.range; shown.truePeak = m.truePeak;
-        if (isShowing())
+
+        // Repaint only when something visible moved (a silent, stopped limiter costs nothing)
+        const auto after = std::array { shown.truePeakL, shown.truePeakR, shown.rmsL, shown.rmsR, shown.reduction, peakHold[0], peakHold[1],
+                                        shown.momentary, shown.shortTerm, shown.integrated, shown.range, shown.truePeak };
+        for (size_t i = 0; i < before.size() && ! changed; ++i)
+            changed = std::abs (after[i] - before[i]) > 0.01f;
+        if (changed && isShowing())
             repaint();
     }
 

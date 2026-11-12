@@ -45,11 +45,41 @@ namespace Limit
 
     struct Meters
     {
-        float inputL = -100.0f, inputR = -100.0f, outputL = -100.0f, outputR = -100.0f;   // dBFS, peak of the last block
         float truePeakL = -100.0f, truePeakR = -100.0f, rmsL = -100.0f, rmsR = -100.0f;  // output: true peak of the last block, RMS (300 ms)
         float reduction = 0.0f, truePeak = -100.0f;                                       // dB; true peak: maximum since reset
         float momentary = -100.0f, shortTerm = -100.0f, integrated = -100.0f, range = 0.0f;   // LUFS, LU
     };
+
+    //==========================================================================
+    // The last 'size' samples, always contiguous (each sample is written twice), oldest first
+    template <int size>
+    struct Window
+    {
+        const float* push (float x) noexcept
+        {
+            data[(size_t) position] = data[(size_t) (position + size)] = x;
+            position = (position + 1) % size;
+            return data.data() + position;   // oldest ... newest (data[position + size - 1] is x)
+        }
+        void clear() noexcept   { data.fill (0.0f); position = 0; }
+
+        std::array<float, 2 * (size_t) size> data {};
+        int position = 0;
+    };
+
+    // Dot product (n a multiple of 4); four sums, so the compiler can use SIMD
+    inline float dot (const float* a, const float* b, int n) noexcept
+    {
+        float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+        for (int k = 0; k < n; k += 4)
+        {
+            s0 += a[k] * b[k];
+            s1 += a[k + 1] * b[k + 1];
+            s2 += a[k + 2] * b[k + 2];
+            s3 += a[k + 3] * b[k + 3];
+        }
+        return (s0 + s1) + (s2 + s3);
+    }
 
     //==========================================================================
     // Loudness after ITU BS.1770 / EBU R128: K-weighting, 100 ms parts; momentary 400 ms,
@@ -243,7 +273,7 @@ namespace Limit
         {
             for (auto& c : channels)
             {
-                c.history.fill (0.0f);
+                c.history.clear();
                 std::fill (c.sums.begin(), c.sums.end(), 0.0);
                 std::fill (c.gains.begin(), c.gains.end(), 1.0f);
                 std::fill (c.delay.begin(), c.delay.end(), 0.0f);
@@ -253,7 +283,6 @@ namespace Limit
                 c.sustain = 0.0f;
                 c.fast = c.slow = 1.0f;
             }
-            historyPosition = 0;
             index = 0;
         }
 
@@ -266,35 +295,26 @@ namespace Limit
         {
             float* io[] { &left, &right };
             float centre[2], need[2];
-            const auto at = [this] (const Channel& ch, int k) { return ch.history[(size_t) ((historyPosition - (taps - 1) + k + taps) % taps)]; };
             for (size_t c = 0; c < 2; ++c)
             {
                 auto& ch = channels[c];
-                ch.history[(size_t) historyPosition] = *io[c];
-                centre[c] = at (ch, taps / 2 - 1);
+                const float* window = ch.history.push (*io[c]);   // the last 'taps' samples, oldest first
+                centre[c] = window[taps / 2 - 1];
                 float peak = std::abs (centre[c]);
                 if (p.truePeak)
                 {
                     if (useInterpolation)
                     {
-                        float window = 0.0f;
-                        for (int k = 0; k < taps; ++k)
-                            window = juce::jmax (window, std::abs (at (ch, k)));
-                        if (window > p.ceiling * 0.5f)
+                        const auto range = juce::FloatVectorOperations::findMinAndMax (window, taps);
+                        if (juce::jmax (-range.getStart(), range.getEnd()) > p.ceiling * 0.5f)
                             for (const auto& phase : interpolation)
-                            {
-                                float v = 0.0f;
-                                for (int k = 0; k < taps; ++k)
-                                    v += phase[(size_t) k] * at (ch, k);
-                                peak = juce::jmax (peak, std::abs (v) * margin);
-                            }
+                                peak = juce::jmax (peak, std::abs (dot (phase.data(), window, taps)) * margin);
                     }
                     else
                         peak *= 1.0116f;   // oversampled 4x / 8x: 0.1 dB for the rest
                 }
                 need[c] = peak;
             }
-            historyPosition = (historyPosition + 1) % taps;
 
             const float linked = juce::jmax (need[0], need[1]);
             const int size = maxLookahead + 1;
@@ -370,7 +390,7 @@ namespace Limit
 
         struct Channel
         {
-            std::array<float, taps> history {};
+            Window<taps> history;
             std::vector<float> minValues, gains, delay;
             std::vector<juce::int64> minIndices;
             std::vector<double> sums;
@@ -380,7 +400,7 @@ namespace Limit
         };
 
         double rate = 48000.0;
-        int maxLookahead = 240, historyPosition = 0;
+        int maxLookahead = 240;
         bool useInterpolation = true;
         juce::int64 index = 0;
         float sustainCoefficient = 0.0f;
@@ -462,7 +482,8 @@ namespace Limit
             switchGain = 1.0f;
             dcState = { 0.0f, 0.0f };
             ditherError = {};
-            meterHistory = {};
+            for (auto& h : meterHistory)
+                h.clear();
             loudness.reset();
             truePeakMax = 0.0f;
             blockTruePeak = rmsState = {};
@@ -474,14 +495,14 @@ namespace Limit
 
         // Meters and history (any thread; the history has one reader: the display)
         float getGainReductionDb() const noexcept   { return reduction.load (std::memory_order_relaxed); }
-        float getOutputPeakDb() const noexcept      { return juce::jmax (meters[2].load(), meters[3].load()); }
         Meters getMeters() const noexcept
         {
             Meters m;
-            m.inputL = meters[0].load(); m.inputR = meters[1].load(); m.outputL = meters[2].load(); m.outputR = meters[3].load();
-            m.reduction = reduction.load(); m.truePeak = meters[4].load();
-            m.momentary = meters[5].load(); m.shortTerm = meters[6].load(); m.integrated = meters[7].load(); m.range = meters[8].load();
-            m.truePeakL = meters[9].load(); m.truePeakR = meters[10].load(); m.rmsL = meters[11].load(); m.rmsR = meters[12].load();
+            m.reduction = reduction.load(); m.truePeak = meters[truePeakMeter].load();
+            m.momentary = meters[momentaryMeter].load(); m.shortTerm = meters[shortTermMeter].load();
+            m.integrated = meters[integratedMeter].load(); m.range = meters[rangeMeter].load();
+            m.truePeakL = meters[truePeakLeft].load(); m.truePeakR = meters[truePeakLeft + 1].load();
+            m.rmsL = meters[rmsLeft].load(); m.rmsR = meters[rmsLeft + 1].load();
             return m;
         }
         void resetLoudness() noexcept   { resetRequest.store (true); }
@@ -560,7 +581,6 @@ namespace Limit
             // Input: gain, DC filter, meters, dry delay (for off)
             float* wl = work.getWritePointer (0);
             float* wr = work.getWritePointer (1);
-            float inPeak[2] {};
             float* dl = dryDelay.getWritePointer (0);
             float* dr = dryDelay.getWritePointer (1);
             const int length = dryDelay.getNumSamples();
@@ -576,7 +596,6 @@ namespace Limit
                         dcState[c] += dcCoefficient * (x[c] - dcState[c]);
                         x[c] -= dcState[c];
                     }
-                    inPeak[c] = juce::jmax (inPeak[c], std::abs (x[c]));
                 }
                 wl[i] = x[0];
                 wr[i] = x[1];
@@ -618,7 +637,6 @@ namespace Limit
             float* pr = padDelay.getWritePointer (1);
             const int pad = padding[(size_t) current], padLength = padDelay.getNumSamples();
             const float ceiling = juce::Decibels::decibelsToGain (s.ceilingDb);
-            float outPeak[2] {};
             for (int i = 0; i < n; ++i)
             {
                 const int slot = (delayPosition + i) % length;
@@ -643,7 +661,6 @@ namespace Limit
                     out[c] = dry[c] + fade * (w - dry[c]);
                     if (s.on && s.ditherBits > 0)
                         out[c] = dither (out[c], c, s.ditherBits, s.noiseShaping);
-                    outPeak[c] = juce::jmax (outPeak[c], std::abs (out[c]));
                 }
                 left[i] = out[0];
                 right[i] = out[1];
@@ -654,17 +671,15 @@ namespace Limit
             padPosition = (padPosition + n) % padLength;
 
             const auto db = [] (float v) { return juce::Decibels::gainToDecibels (v, -100.0f); };
-            meters[0].store (db (inPeak[0])); meters[1].store (db (inPeak[1]));
-            meters[2].store (db (outPeak[0])); meters[3].store (db (outPeak[1]));
-            meters[4].store (db (truePeakMax));
+            meters[truePeakMeter].store (db (truePeakMax));
             for (size_t c = 0; c < 2; ++c)
             {
-                meters[9 + c].store (db (blockTruePeak[c]));
-                meters[11 + c].store (juce::Decibels::gainToDecibels (std::sqrt (rmsState[c]), -100.0f));
+                meters[truePeakLeft + c].store (db (blockTruePeak[c]));
+                meters[rmsLeft + c].store (db (std::sqrt (rmsState[c])));
                 blockTruePeak[c] = 0.0f;
             }
-            meters[5].store (loudness.momentary); meters[6].store (loudness.shortTerm);
-            meters[7].store (loudness.integrated); meters[8].store (loudness.range);
+            meters[momentaryMeter].store (loudness.momentary); meters[shortTermMeter].store (loudness.shortTerm);
+            meters[integratedMeter].store (loudness.integrated); meters[rangeMeter].store (loudness.range);
             reduction.store (s.on ? juce::Decibels::gainToDecibels (lowest, -60.0f) : 0.0f, std::memory_order_relaxed);
         }
 
@@ -698,21 +713,14 @@ namespace Limit
             float* x[] { &l, &r };
             for (size_t c = 0; c < 2; ++c)
             {
-                auto& h = meterHistory[c];
-                h[(size_t) meterPosition] = *x[c];
+                const float* window = meterHistory[c].push (*x[c]);
                 float peak = std::abs (*x[c]);
                 for (const auto& phase : meterKernel)
-                {
-                    float v = 0.0f;
-                    for (int k = 0; k < 16; ++k)
-                        v += phase[(size_t) k] * h[(size_t) ((meterPosition - 15 + k + 16) % 16)];
-                    peak = juce::jmax (peak, std::abs (v));
-                }
+                    peak = juce::jmax (peak, std::abs (dot (phase.data(), window, 16)));
                 truePeakMax = juce::jmax (truePeakMax, peak);
                 blockTruePeak[c] = juce::jmax (blockTruePeak[c], peak);
                 rmsState[c] += rmsCoefficient * (*x[c] * *x[c] - rmsState[c]);
             }
-            meterPosition = (meterPosition + 1) % 16;
 
             // History column
             column.input = juce::jmax (column.input, input);
@@ -745,12 +753,12 @@ namespace Limit
         juce::uint32 seed = 22222u;
 
         std::array<std::array<float, 16>, 3> meterKernel {};
-        std::array<std::array<float, 16>, 2> meterHistory {};
-        int meterPosition = 0;
+        std::array<Window<16>, 2> meterHistory;
         float truePeakMax = 0.0f;
         Loudness loudness;
         std::atomic<bool> resetRequest { false };
-        std::array<std::atomic<float>, 13> meters { -100.0f, -100.0f, -100.0f, -100.0f, -100.0f, -100.0f, -100.0f, -100.0f, 0.0f, -100.0f, -100.0f, -100.0f, -100.0f };
+        enum : size_t { truePeakMeter, momentaryMeter, shortTermMeter, integratedMeter, rangeMeter, truePeakLeft, rmsLeft = truePeakLeft + 2, numMeters = rmsLeft + 2 };
+        std::array<std::atomic<float>, numMeters> meters { -100.0f, -100.0f, -100.0f, -100.0f, 0.0f, -100.0f, -100.0f, -100.0f, -100.0f };
         std::array<float, 2> blockTruePeak {}, rmsState {};
         float rmsCoefficient = 0.0f;
         std::atomic<float> reduction { 0.0f };

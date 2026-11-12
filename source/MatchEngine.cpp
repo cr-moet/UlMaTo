@@ -238,16 +238,7 @@ void MatchEngine::prepare (double newSampleRate, int)
 
     // Filter length: about 85 ms (frequency resolution ~12 Hz), power of two
     firLength    = juce::nextPowerOfTwo ((int) (sampleRate * 0.085));
-    designFft    = std::make_unique<juce::dsp::FFT> (juce::roundToInt (std::log2 (firLength)));
-    partitionFft = std::make_unique<juce::dsp::FFT> (juce::roundToInt (std::log2 (2 * blockSize)));
-    for (auto& d : designData)
-        d.assign ((size_t) firLength * 2, 0.0f);
-    designIr.assign ((size_t) firLength, 0.0f);
-    designWindow.resize ((size_t) firLength);
-    juce::dsp::WindowingFunction<float>::fillWindowingTables (designWindow.data(), (size_t) firLength,
-                                                              juce::dsp::WindowingFunction<float>::blackman, false);
-
-    convolver.prepare (blockSize, firLength);
+    matchFilter.prepare (blockSize, firLength, Tone::FirStage::Window::blackman);   // starts neutral (a pure delay)
     dynamics.prepare (sampleRate);
     stageDynamics.prepare (sampleRate);
     pivot = {};
@@ -276,12 +267,7 @@ void MatchEngine::prepare (double newSampleRate, int)
     switchStep = 1.0f / (float) (sampleRate * 0.01);
     switchMute = 0;
 
-    // Both slots start neutral (pure delay)
     applied = {};
-    for (auto& f : filters)
-        designFilters (applied, f);
-    activeFilters = 0;
-    newFilters = false;
     firstFilters = false;
 
     delayLine.setSize (2, lookahead);
@@ -474,16 +460,7 @@ void MatchEngine::processBlock() noexcept
 
         if (stage == eqStage)
         {
-            // New filters from the engine thread: cross-fade within this block
-            const int active  = activeFilters.load (std::memory_order_relaxed);
-            const bool change = newFilters.load (std::memory_order_acquire);
-            convolver.process (blockL.data(), blockR.data(), filters[(size_t) active],
-                               change ? &filters[(size_t) (1 - active)] : nullptr);
-            if (change)
-            {
-                activeFilters.store (1 - active, std::memory_order_relaxed);
-                newFilters.store (false, std::memory_order_release);
-            }
+            matchFilter.process (blockL.data(), blockR.data());   // new filters cross-fade within this block
         }
         else if (stage == dynamicsStage)
         {
@@ -513,7 +490,7 @@ void MatchEngine::processBlock() noexcept
 
         // Bypass: ramp over the block towards the target
         const float target = bypassRequest[(size_t) stage] ? 0.0f : 1.0f;
-        if (by.mix != 1.0f || target != 1.0f)
+        if (! juce::exactlyEqual (by.mix, 1.0f) || ! juce::exactlyEqual (target, 1.0f))
         {
             const float start = by.mix, end = start + juce::jlimit (-mixStep, mixStep, target - start);
             for (size_t j = 0; j < (size_t) blockSize; ++j)
@@ -628,10 +605,8 @@ void MatchEngine::updateFilters (double seconds)
 
     // New filters only when something changed and the audio thread has taken the
     // previous ones (otherwise the next update tries again)
-    if ((firstFilters || maxDifference (c, applied) > 0.02f) && ! newFilters.load (std::memory_order_acquire))
+    if ((firstFilters || maxDifference (c, applied) > 0.02f) && matchFilter.update (sampleRate, [&] (float f) { return matchResponse (c, f); }))
     {
-        designFilters (c, filters[(size_t) (1 - activeFilters.load (std::memory_order_relaxed))]);
-        newFilters.store (true, std::memory_order_release);
         applied = c;
         firstFilters = false;
     }
@@ -775,39 +750,16 @@ void MatchEngine::updateDynamicsMatch()
 // Linear-phase 2x2 filter matrix from the correction curves:
 //   HL, HR: left/right gain with half of the phase difference each,
 //   M, S:   mid/side gain  ->  a = (M+S)/2 HL, b = (M-S)/2 HR, c = (M-S)/2 HL, d = (M+S)/2 HR
-// Each response -> inverse FFT -> centred, windowed impulse response -> partition spectra
-void MatchEngine::designFilters (const Correction& c, MatrixConvolver::Filters& f)
+Tone::FirStage::Response MatchEngine::matchResponse (const Correction& c, float frequency) const
 {
-    const int n = firLength;
-    for (auto& d : designData)
-        std::fill (d.begin(), d.end(), 0.0f);
+    const float band = bandOfFrequency (frequency);
+    const bool  real = frequency <= 0.0f || frequency >= (float) (sampleRate * 0.5);   // DC and Nyquist: no phase
+    const float half = real ? 0.0f : 0.5f * interpolate (c.phase, band);
 
-    for (int k = 0; k <= n / 2; ++k)
-    {
-        const float band = bandOfFrequency ((float) ((double) k * sampleRate / n));
-        const bool  real = k == 0 || k == n / 2;   // DC and Nyquist must stay real
-        const float half = real ? 0.0f : 0.5f * interpolate (c.phase, band);
-
-        const auto hl = std::polar (juce::Decibels::decibelsToGain (interpolate (c.left,  band)),  half);
-        const auto hr = std::polar (juce::Decibels::decibelsToGain (interpolate (c.right, band)), -half);
-        const float m = juce::Decibels::decibelsToGain (interpolate (c.mid,  band));
-        const float s = juce::Decibels::decibelsToGain (interpolate (c.side, band));
-        const float p = 0.5f * (m + s), q = 0.5f * (m - s);
-
-        const std::complex<float> values[] { p * hl, q * hr, q * hl, p * hr };
-        for (size_t i = 0; i < 4; ++i)
-        {
-            designData[i][(size_t) k * 2]     = values[i].real();
-            designData[i][(size_t) k * 2 + 1] = values[i].imag();
-        }
-    }
-
-    std::vector<float>* targets[] { &f.a, &f.b, &f.c, &f.d };
-    for (size_t i = 0; i < 4; ++i)
-    {
-        designFft->performRealOnlyInverseTransform (designData[i].data());
-        for (int j = 0; j < n; ++j)
-            designIr[(size_t) j] = designData[i][(size_t) ((j + n / 2) % n)] * designWindow[(size_t) j];
-        MatrixConvolver::makeSpectra (designIr.data(), n, blockSize, *partitionFft, partitionScratch, *targets[i]);
-    }
+    const auto hl = std::polar (juce::Decibels::decibelsToGain (interpolate (c.left,  band)),  half);
+    const auto hr = std::polar (juce::Decibels::decibelsToGain (interpolate (c.right, band)), -half);
+    const float m = juce::Decibels::decibelsToGain (interpolate (c.mid,  band));
+    const float s = juce::Decibels::decibelsToGain (interpolate (c.side, band));
+    const float p = 0.5f * (m + s), q = 0.5f * (m - s);
+    return { p * hl, q * hr, q * hl, p * hr };
 }

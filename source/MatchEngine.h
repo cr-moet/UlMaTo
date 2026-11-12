@@ -1,7 +1,6 @@
 #pragma once
 
 #include "Spectrum.h"
-#include "MatrixConvolver.h"
 #include "Dynamics.h"
 #include "Analog.h"
 #include "ToneStages.h"
@@ -74,7 +73,6 @@ public:
 
     // Limiter meters (any thread)
     float getLimiterReductionDb() const noexcept   { return limiter.getGainReductionDb(); }
-    float getLimiterOutputDb() const noexcept      { return limiter.getOutputPeakDb(); }
     Limit::Meters getLimiterMeters() const noexcept   { return limiter.getMeters(); }
     float getAnalogVuDb (int channel) const noexcept  { return analog.getVuDb (channel); }
     int readLimiterColumns (Limit::Column* destination, int maxCount) noexcept   { return limiter.readColumns (destination, maxCount); }
@@ -156,9 +154,9 @@ private:
     void run() override;
     void updateLearning();
     void updateFilters (double seconds);
+    Tone::FirStage::Response matchResponse (const Correction& c, float frequency) const;
     void updateDynamic (const Spectrum::Profile& ref, const Spectrum::Profile& live,
                         const Spectrum::Curve& fastMid, const Spectrum::Curve& fastSide, double seconds);
-    void designFilters (const Correction& c, MatrixConvolver::Filters& filters);
     void updateDynamicsMatch();
     void processBlock() noexcept;
     void updateToneStages();
@@ -199,19 +197,10 @@ private:
     bool firstFilters = true, longTermValid = false;
     std::atomic<bool> profilesChanged { true };
 
-    // Filter design (engine thread)
-    std::unique_ptr<juce::dsp::FFT> designFft, partitionFft;
-    std::array<std::vector<float>, 4> designData;
-    std::vector<float> designWindow, designIr, partitionScratch;
+    // EQ match filter: designed on the engine thread, cross-faded in on the audio thread
+    Tone::FirStage matchFilter;
 
-    // Hand-over: the engine fills slot [1 - active] while newFilters is false,
-    // the audio thread switches (cross-fade) and clears newFilters
-    std::array<MatrixConvolver::Filters, 2> filters;
-    std::atomic<int> activeFilters { 0 };
-    std::atomic<bool> newFilters { false };
-
-    // Audio thread: lookahead delay, block buffering, convolution
-    MatrixConvolver convolver;
+    // Audio thread: lookahead delay, block buffering
     Dynamics::Matcher dynamics;
     Dynamics::Analyser stageDynamics;   // engine thread: readings of the dynamics stage
     Dynamics::Values pivot {};          // engine thread: gliding centre per band
